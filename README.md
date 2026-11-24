@@ -3,7 +3,12 @@
 A Redis-compatible in-memory key-value store written from scratch in C++17 —
 no threads, no external libraries, just POSIX sockets and Linux `epoll`.
 
-> **Status:** work in progress. Built in stages; see the commit history.
+> Built in stages (see the commit history); every stage was reviewed,
+> tested against real Redis, and leak-checked.
+
+**~417k ops/sec** on `redis-benchmark` (SET/GET, 50 clients), **~3M ops/sec**
+pipelined; **0 leaks** under Valgrind; replies byte-identical to Redis 7 on the
+shared test suite. Details below.
 
 ## Roadmap
 
@@ -15,7 +20,7 @@ no threads, no external libraries, just POSIX sockets and Linux `epoll`.
 - [x] Stage 4 — key-value store: `SET`, `GET`, `DEL` (+ `EXISTS`, `DBSIZE`)
 - [x] Stage 5 — key expiry: `EXPIRE`, `TTL` (min-heap timer + lazy deletion)
 - [x] Stage 6 — tests + Valgrind leak check under load
-- [ ] Stage 7 — `redis-benchmark` results
+- [x] Stage 7 — `redis-benchmark` results
 
 ## Layout
 
@@ -43,6 +48,7 @@ container. The source is bind-mounted, so edit on the host as usual.
                       # differential run vs real Redis
 ./dev make unit       # just the store/expiry-heap unit test (fake clock)
 ./dev make valgrind   # leak/memory-error check under load -> results/valgrind.txt
+./dev make bench      # benchmark vs real Redis -> results/benchmark.md
 
 # in a second terminal (same container):
 ./dev redis-cli
@@ -88,3 +94,26 @@ which aren't implemented and make it exit.
 | Expiry heap | `make unit`: fake-clock randomized tests vs a reference model, invariants after every op; mutation-tested | 11/11 planted bugs caught |
 | Memory safety, live | every `make test` runs an AddressSanitizer build and checks LeakSanitizer at a graceful exit | clean |
 | **Leaks under load** | `make valgrind`: the -O2 server under memcheck (`--leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=all --track-fds=yes`) through redis-benchmark, connection churn, TTL churn, the integration suite and a mass expiry, then SIGTERM with live clients and keys | **0 bytes in use at exit, 0 errors, 0 leaked fds** ([results/valgrind.txt](results/valgrind.txt)); the script is shown to FAIL on planted leaks, fd leaks and use-after-free |
+
+## Performance
+
+`make bench` runs lite-redis and a real Redis 7.0.15 side by side on the same
+machine (each pinned to one core, client on other cores, median of 3 runs of
+~10 s, alternating). Full table with latencies and min–max ranges:
+[results/benchmark.md](results/benchmark.md). On an Apple M1 (Docker Linux VM):
+
+| Workload | lite-redis | Redis 7.0.15 |
+|---|---|---|
+| SET / GET, 50 clients, server saturated | **417k / 417k ops/s** | 351k / 364k |
+| SET / GET, pipelined `-P 16` | **2.93M / 3.16M** | 1.67M / 2.00M |
+| SET / GET, 1000 clients | **389k / 380k** | 307k / 320k |
+| `SET ... EX 100`, 1M random keys, `-P 16` | **864k** | 695k |
+
+Where the time goes: without pipelining ~80% of the server's CPU is in the
+kernel (`read`/`write`/`epoll_wait` and TCP), one read and one write syscall
+per request; pipelining amortizes those syscalls, which is why `-P 16` is 7×
+faster. Caveats: real Redis does much more per command (stats, keyspace
+notifications, persistence/replication hooks, many data types), lite-redis's
+p99 is higher than Redis's in the TTL and 1 KB SET workloads, and plain
+`redis-benchmark` with its default single client thread tops out at ~260k
+for *both* servers. That run measures the client, not the server.

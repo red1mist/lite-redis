@@ -9,7 +9,7 @@ OBJ := $(SRC:src/%.cpp=$(OBJ_DIR)/%.o)
 BIN := lite-redis-server
 DEBUG_BIN := lite-redis-server-debug
 
-.PHONY: all debug clean run run-debug test unit valgrind
+.PHONY: all debug clean run run-debug test unit valgrind bench
 
 # Default target: optimized build, used when you just run `make`.
 all: CXXFLAGS += -O2
@@ -67,3 +67,8 @@ VG_BIN := lite-redis-server-vg
 valgrind:
 	$(CXX) $(CXXFLAGS) -O2 -g -o $(VG_BIN) $(SRC) $(LDFLAGS)
 	./test/valgrind.sh
+
+# Throughput/latency vs real Redis on the same machine -> results/benchmark.md.
+# Set HOST_CPU to name the host in the report (the container can't see it).
+bench: all
+	python3 test/bench.py
