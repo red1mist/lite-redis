@@ -26,10 +26,20 @@ TARGET = os.environ.get("TARGET", "lite")
 K = f"t{os.getpid()}:"
 
 LITE_ONLY = set()
+TIMING = set()
+# SLOW_SERVER=1 (used by test/valgrind.sh): the server runs 20-50x slower
+# under Valgrind, so tests that assert latencies/deadlines are skipped there.
+# Everything else (correctness, error paths, disconnects) still runs.
+SLOW_SERVER = os.environ.get("SLOW_SERVER") == "1"
 
 
 def lite_only(fn):
     LITE_ONLY.add(fn.__name__)
+    return fn
+
+
+def timing_sensitive(fn):
+    TIMING.add(fn.__name__)
     return fn
 
 
@@ -653,6 +663,7 @@ def test_protocol_error_bare_lf_is_sanitized():
         assert c.is_closed()
 
 
+@timing_sensitive
 def test_many_args_trickled_is_not_quadratic():
     # 200k one-byte args arriving in ~1 KB pieces = ~1400 reads. A parser
     # that restarts from byte 0 on every read does ~1400 x 200k arg parses
@@ -684,6 +695,7 @@ def rss_kb(pid):
 
 
 @lite_only  # needs the server's pid (SERVER_PID, set by run_tests.sh)
+@timing_sensitive
 def test_output_backpressure_bounds_memory():
     # ~3000 "GET bigkey" (1 MB value) fit in ~70 KB of request bytes, i.e.
     # about one read(). Without pausing execution at MAX_WBUF the server
@@ -791,6 +803,7 @@ def test_protocol_error_with_trailing_input_delivers_all_replies():
                                  b"-ERR Protocol error: invalid bulk length\r\n")
 
 
+@timing_sensitive
 def test_write_whole_pipeline_then_read_does_not_deadlock():
     # Like redis-py's pipeline.execute(): send EVERYTHING, then read. If the
     # server stopped reading while backpressured, both sides would block
@@ -897,6 +910,7 @@ def test_active_expiry_removes_untouched_keys():
 
 
 @lite_only  # real Redis expires actively on a ~100 ms sampling cycle
+@timing_sensitive
 def test_active_expiry_is_timely():
     # The heap tells the event loop exactly when the next key is due, so an
     # untouched key disappears within a few ms of its deadline.
@@ -1049,6 +1063,7 @@ def test_expired_key_is_replaced_fresh():
 
 
 @lite_only  # measures our event loop's behaviour during a mass expiry
+@timing_sensitive
 def test_mass_expiry_does_not_stall_clients():
     # 200k keys all expiring in the same millisecond: the loop deletes them in
     # bounded batches, so other clients keep getting answers meanwhile.
@@ -1117,6 +1132,10 @@ if __name__ == "__main__":
         if TARGET != "lite" and name in LITE_ONLY:
             skipped += 1
             print(f"SKIP {name} (lite-redis specific)")
+            continue
+        if SLOW_SERVER and name in TIMING:
+            skipped += 1
+            print(f"SKIP {name} (timing-sensitive; SLOW_SERVER)")
             continue
         t0 = time.time()
         try:

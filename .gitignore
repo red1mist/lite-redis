@@ -3,3 +3,4 @@ build/
 *.dSYM/
 lite-redis-server
 lite-redis-server-debug
+lite-redis-server-vg

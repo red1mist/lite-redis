@@ -14,7 +14,7 @@ no threads, no external libraries, just POSIX sockets and Linux `epoll`.
 - [x] Stage 3 — RESP protocol parser (`redis-cli` compatible)
 - [x] Stage 4 — key-value store: `SET`, `GET`, `DEL` (+ `EXISTS`, `DBSIZE`)
 - [x] Stage 5 — key expiry: `EXPIRE`, `TTL` (min-heap timer + lazy deletion)
-- [ ] Stage 6 — tests + Valgrind leak check under load
+- [x] Stage 6 — tests + Valgrind leak check under load
 - [ ] Stage 7 — `redis-benchmark` results
 
 ## Layout
@@ -42,6 +42,7 @@ container. The source is bind-mounted, so edit on the host as usual.
 ./dev make test       # unit tests + ASan build + all integration tests +
                       # differential run vs real Redis
 ./dev make unit       # just the store/expiry-heap unit test (fake clock)
+./dev make valgrind   # leak/memory-error check under load -> results/valgrind.txt
 
 # in a second terminal (same container):
 ./dev redis-cli
@@ -77,3 +78,13 @@ which aren't implemented and make it exit.
   never accumulates stale nodes.
 - Deadlines use `CLOCK_MONOTONIC`, so wall-clock adjustments can't mass-expire
   keys. (`EXAT`/`PXAT`/`EXPIREAT` absolute times are not supported.)
+
+## Verification
+
+| What | How | Result |
+|---|---|---|
+| Correctness | `make test`: 80+ raw-socket integration tests (fragmented/pipelined input, protocol errors, RST/half-close, backpressure, 32 MB values, expiry) | all pass |
+| Redis compatibility | the same suite run against a real `redis-server` 7.0.15 (differential testing) | all shared tests match |
+| Expiry heap | `make unit`: fake-clock randomized tests vs a reference model, invariants after every op; mutation-tested | 11/11 planted bugs caught |
+| Memory safety, live | every `make test` runs an AddressSanitizer build and checks LeakSanitizer at a graceful exit | clean |
+| **Leaks under load** | `make valgrind`: the -O2 server under memcheck (`--leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=all --track-fds=yes`) through redis-benchmark, connection churn, TTL churn, the integration suite and a mass expiry, then SIGTERM with live clients and keys | **0 bytes in use at exit, 0 errors, 0 leaked fds** ([results/valgrind.txt](results/valgrind.txt)); the script is shown to FAIL on planted leaks, fd leaks and use-after-free |

@@ -9,7 +9,7 @@ OBJ := $(SRC:src/%.cpp=$(OBJ_DIR)/%.o)
 BIN := lite-redis-server
 DEBUG_BIN := lite-redis-server-debug
 
-.PHONY: all debug clean run run-debug test unit
+.PHONY: all debug clean run run-debug test unit valgrind
 
 # Default target: optimized build, used when you just run `make`.
 all: CXXFLAGS += -O2
@@ -46,7 +46,7 @@ run-debug: debug
 	./$(DEBUG_BIN)
 
 clean:
-	rm -rf $(OBJ_DIR) $(BIN) $(DEBUG_BIN) $(DEBUG_BIN).dSYM $(UNIT_BIN)
+	rm -rf $(OBJ_DIR) $(BIN) $(DEBUG_BIN) $(DEBUG_BIN).dSYM $(UNIT_BIN) $(VG_BIN)
 
 # Unit test of the keyspace + expiry heap with a fake clock, under
 # AddressSanitizer and UndefinedBehaviorSanitizer.
@@ -59,3 +59,11 @@ unit: | $(OBJ_DIR)
 # Unit tests, then the ASan server on a spare port with all integration tests.
 test: unit debug
 	./test/run_tests.sh
+
+# Valgrind leak/memory-error check under load. Same -O2 as the release build
+# (so we test what ships) plus -g for line numbers in any report; no
+# sanitizers (they can't be combined with Valgrind). Writes results/valgrind.txt.
+VG_BIN := lite-redis-server-vg
+valgrind:
+	$(CXX) $(CXXFLAGS) -O2 -g -o $(VG_BIN) $(SRC) $(LDFLAGS)
+	./test/valgrind.sh
