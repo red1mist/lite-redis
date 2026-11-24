@@ -728,6 +728,125 @@ def test_backpressure_then_half_close_delivers_everything():
 
 
 # --------------------------------------------------------------------------
+# Regressions from the second (fuzzing) review of the Stage 4 fixes
+# --------------------------------------------------------------------------
+
+def slow_read_all(sock, expected_len, slow_secs=2.0):
+    """Read like a slow client (small chunks, pauses) then fast, until EOF."""
+    got, err = bytearray(), None
+    t_end = time.time() + slow_secs
+    try:
+        while True:
+            if time.time() < t_end:
+                chunk = sock.recv(4096)
+                time.sleep(0.01)
+            else:
+                chunk = sock.recv(1 << 16)
+            if not chunk:
+                break
+            got += chunk
+    except OSError as e:
+        err = e
+    return bytes(got), err
+
+
+def _send_ignoring_errors(sock, data):
+    try:
+        sock.sendall(data)
+    except OSError:
+        pass  # the server may close (correctly) before we finish sending junk
+
+
+def _closing_with_trailing_input(terminator, final_reply):
+    # Slow reader (tiny receive buffer) pipelines 50 big GETs, then QUIT or a
+    # malformed command, then 200 KB more. All replies must arrive: closing
+    # with unread input would make Linux send RST and drop queued replies.
+    key = K + "rst-big"
+    val = b"r" * 100000
+    with Client() as c:
+        c.cmd("SET", key, val)
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8192)
+    s.settimeout(30)
+    s.connect((HOST, PORT))
+    req = encode("GET", key) * 50 + terminator + b"PING\r\n" * 33000
+    t = threading.Thread(target=_send_ignoring_errors, args=(s, req))
+    t.start()
+    want = (b"$100000\r\n" + val + b"\r\n") * 50 + final_reply
+    got, err = slow_read_all(s, len(want))
+    t.join()
+    s.close()
+    with Client() as c:
+        c.cmd("DEL", key)
+    assert err is None, f"connection error {err!r} after {len(got)}/{len(want)} bytes"
+    assert got == want, f"got {len(got)} of {len(want)} bytes"
+
+
+def test_quit_with_trailing_input_delivers_all_replies():
+    _closing_with_trailing_input(encode("QUIT"), b"+OK\r\n")
+
+
+def test_protocol_error_with_trailing_input_delivers_all_replies():
+    _closing_with_trailing_input(b"*1\r\n$x\r\n",
+                                 b"-ERR Protocol error: invalid bulk length\r\n")
+
+
+def test_write_whole_pipeline_then_read_does_not_deadlock():
+    # Like redis-py's pipeline.execute(): send EVERYTHING, then read. If the
+    # server stopped reading while backpressured, both sides would block
+    # forever (its send window full, our receive window full).
+    key = K + "wv"
+    n = 800000
+    with Client() as c:
+        c.cmd("SET", key, "0123456789")
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+    s.settimeout(20)
+    s.connect((HOST, PORT))
+    c = Client.__new__(Client)
+    c.sock, c.buf = s, b""
+    one = encode("GET", key)
+    try:
+        s.sendall(one * n)  # blocks forever on the deadlock bug -> timeout
+    except socket.timeout:
+        raise AssertionError("sendall stuck: server stopped reading (deadlock)")
+    for _ in range(n):
+        assert c.read_reply() == b"0123456789"
+    s.close()
+
+
+def test_header_error_is_split_invariant():
+    # Same bytes, different TCP splits, must give the same reply.
+    stream = b"*1\r\n$4" + b"x" * 40 + b"\r\nPING\r\n"
+    for cut in [len(stream), 20, 44]:
+        with Client() as c:
+            c.send_raw(stream[:cut])
+            time.sleep(0.05)
+            if cut < len(stream):
+                try:
+                    c.send_raw(stream[cut:])
+                except OSError:
+                    pass
+            check(str(c.read_reply()), "ERR Protocol error: invalid bulk length")
+
+
+def test_unknown_command_text_stops_at_nul():
+    with Client() as c:
+        check(str(c.cmd(b"ab\x00cd", "x")),
+              "ERR unknown command 'ab', with args beginning with: 'x' ")
+        check(str(c.cmd("FOO", b"a\x00b", "z")),
+              "ERR unknown command 'FOO', with args beginning with: 'a' 'z' ")
+
+
+@lite_only  # Redis stalls on this input instead of replying
+def test_protocol_error_never_contains_nul():
+    with Client() as c:
+        c.send_raw(b"*1\r\n\x004\r\nPING\r\n")
+        check(str(c.read_reply()), "ERR Protocol error: expected '$', got ' '")
+
+
+# --------------------------------------------------------------------------
 
 if __name__ == "__main__":
     filters = sys.argv[1:]

@@ -25,6 +25,7 @@
 #include <string>
 #include <sys/epoll.h>
 #include <sys/resource.h>
+#include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <vector>
@@ -36,14 +37,18 @@ constexpr int DEFAULT_PORT = 6379;
 constexpr int BACKLOG = 511;
 constexpr int MAX_EVENTS = 256;          // events returned per epoll_wait call
 constexpr size_t READ_CHUNK = 64 * 1024; // bytes per read() syscall
-// Backpressure threshold for a client's pending output. Past it we (1) stop
-// executing that client's queued commands and (2) stop reading from it,
-// until the kernel has taken the output. So a client that pipelines faster
-// than it reads replies can't make the server buffer unbounded output.
+// Backpressure threshold for a client's pending output. Past it we stop
+// EXECUTING that client's queued commands until the kernel has taken the
+// output, so a client that pipelines faster than it reads replies can't make
+// the server build unbounded output. We keep READING meanwhile (see
+// update_interest for why), bounded by MAX_QUERY_BUF.
 constexpr size_t MAX_WBUF = 1024 * 1024;
 // Hard cap on a client's unparsed input (same default as Redis's
 // client-query-buffer-limit). Exceed it and the client is disconnected.
 constexpr size_t MAX_QUERY_BUF = 1024ul * 1024 * 1024;
+// While the listener is switched off after fd exhaustion, retry this often
+// (in case no client ever disconnects to free an fd).
+constexpr int LISTENER_RETRY_MS = 100;
 // Buffers bigger than this are given back to the allocator once idle, so one
 // big request doesn't pin memory for the rest of a connection's life.
 constexpr size_t IDLE_BUF_KEEP = 64 * 1024;
@@ -73,7 +78,8 @@ struct Conn {
     // Client sent EOF (it may have only half-closed). Run what's left in
     // rbuf, flush the replies, then close.
     bool peer_eof = false;
-    // QUIT or a protocol error: run nothing more, flush, then close.
+    // QUIT or a protocol error: run nothing more, flush, then close. Input
+    // that still arrives is read and thrown away (see handle_read).
     bool closing = false;
 };
 
@@ -92,14 +98,13 @@ static int spare_fd = -1;
 // listener; re-armed when a connection closes and frees an fd.
 static bool listener_disarmed = false;
 
-// Set by SIGINT/SIGTERM. The handler only sets a flag (almost nothing is
-// safe to call inside a signal handler); the event loop does the shutdown.
-static volatile sig_atomic_t stop_requested = 0;
+// SIGINT/SIGTERM arrive as readable data on this fd (signalfd), handled by
+// the event loop like any other event.
+static int signal_fd = -1;
+static bool stop_requested = false;
 
 // The whole keyspace. Only the event-loop thread touches it, so no locking.
 static Store store;
-
-static void on_stop_signal(int) { stop_requested = 1; }
 
 // For errors that can repeat thousands of times per second (EMFILE under a
 // connection flood): print at most one line per second, so a bad situation
@@ -138,15 +143,22 @@ static size_t pending_output(const Conn& c) { return c.wbuf.size() - c.wpos; }
 // risk never hearing about that socket again.
 //
 // Which events we ask for is derived purely from the connection's state:
-//   - EPOLLIN only if we'd actually use more input right now: not closing,
-//     no EOF seen (after EOF the socket is permanently "readable", which
-//     level-triggered epoll would report on every iteration), not paused,
-//     and output below MAX_WBUF (backpressure).
+//   - EPOLLIN unless we've seen EOF (after EOF the socket is permanently
+//     "readable", which level-triggered epoll would report every iteration).
+//     Note we keep reading even while paused by backpressure. Stopping reads
+//     looks tidy (TCP flow control would push back on the client) but it
+//     DEADLOCKS clients that write a whole pipeline before reading any reply
+//     (e.g. redis-py's pipeline.execute()): their send() blocks on our full
+//     receive window, our replies sit unread in theirs, and both sides wait
+//     forever. Real Redis also keeps reading, up to its query buffer limit.
+//     So output is bounded by pausing execution, input by MAX_QUERY_BUF.
+//     A closing connection keeps reading too, to discard input: see
+//     handle_read.
 //   - EPOLLOUT only while there is unsent output. Asking for EPOLLOUT all the
 //     time would be a busy loop: an idle socket is almost always writable.
 static void update_interest(Conn& c) {
     uint32_t want = 0;
-    if (!c.closing && !c.peer_eof && !c.paused && pending_output(c) < MAX_WBUF) want |= EPOLLIN;
+    if (!c.peer_eof) want |= EPOLLIN;
     if (pending_output(c) > 0) want |= EPOLLOUT;
     if (want == c.interest) return; // skip a pointless epoll_ctl syscall
 
@@ -205,16 +217,22 @@ static void handle_accept() {
                 // fix (libev, nginx): give up the spare fd we kept for this,
                 // accept the connection, tell it why, close it, re-reserve.
                 log_ratelimited("accept: out of file descriptors; rejecting connections");
+                // (Linux reports EMFILE even when nobody is queued, because it
+                // allocates the fd before looking at the backlog. That's why
+                // EAGAIN from the second accept below just means "done".)
                 if (spare_fd >= 0) {
                     close(spare_fd);
                     spare_fd = -1;
                     int victim = accept4(listen_fd, nullptr, nullptr, SOCK_CLOEXEC);
+                    int victim_errno = errno;
                     if (victim >= 0) reject(victim, "-ERR max number of clients reached\r\n");
                     spare_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
                     if (victim >= 0) continue; // maybe more are queued
+                    if (victim_errno == EAGAIN || victim_errno == EWOULDBLOCK) return;
                 }
                 // Couldn't even do that: stop watching the listener until a
-                // client disconnects (close_conn re-arms it).
+                // client disconnects (close_conn re-arms it) or the retry
+                // timer in the main loop fires.
                 set_listener(false);
                 return;
             }
@@ -305,6 +323,12 @@ static void process_input(Conn& c) {
         execute_command(args, ctx);
         if (ctx.close_after_reply) c.closing = true;
     }
+    if (c.closing) { // nothing after QUIT / a protocol error will ever run
+        std::string().swap(c.rbuf);
+        c.parse.reset();
+        c.paused = false;
+        return;
+    }
     // Drop all consumed bytes with ONE erase per call, not one per command.
     // The partial command (if any) moves to rbuf[0]; c.parse stores offsets
     // relative to the command's start, so they stay valid.
@@ -387,6 +411,11 @@ static void handle_read(Conn& c) {
         // are paused and will run); flush() closes once all replies are out.
         // An incomplete trailing command can never complete: dropped.
         c.peer_eof = true;
+    } else if (c.closing) {
+        // After QUIT / a protocol error: read and DISCARD. If we left these
+        // bytes unread, close() would find data in the receive queue, and
+        // Linux then sends RST instead of FIN, which throws away replies still
+        // in our send queue, so a slow reader would lose its last replies.
     } else {
         c.rbuf.append(buf, static_cast<size_t>(n));
         if (c.rbuf.size() > MAX_QUERY_BUF) {
@@ -450,25 +479,28 @@ int main(int argc, char** argv) {
     // default action kills the process. Ignore it and handle EPIPE instead.
     signal(SIGPIPE, SIG_IGN);
 
-    // Graceful shutdown on Ctrl-C / `kill`: so leak checkers (Valgrind, ASan)
+    // Graceful shutdown on Ctrl-C / `kill`, so leak checkers (Valgrind, ASan)
     // see a normal exit with every connection freed, not a process killed
     // mid-flight.
     //
-    // The race to avoid: a signal arriving just BEFORE we enter epoll_wait
-    // would set the flag, but we'd then sleep (possibly forever) without
-    // noticing. Fix: keep SIGINT/SIGTERM blocked while running, and let
-    // epoll_pwait unblock them atomically only while sleeping (same idea
-    // as pselect). The signal then always interrupts the wait (EINTR).
-    struct sigaction sa{};
-    sa.sa_handler = on_stop_signal;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGINT, &sa, nullptr);
-    sigaction(SIGTERM, &sa, nullptr);
-    sigset_t blocked, wait_mask;
-    sigemptyset(&blocked);
-    sigaddset(&blocked, SIGINT);
-    sigaddset(&blocked, SIGTERM);
-    sigprocmask(SIG_BLOCK, &blocked, &wait_mask); // wait_mask = mask without them
+    // signalfd turns the signals into an fd that becomes readable when one
+    // is pending; we put it in the epoll set and handle it like any other
+    // event. That avoids both classic problems: no async signal handler (and
+    // its restrictions), and no race between "check the flag" and "go to
+    // sleep". (An earlier version blocked the signals and unblocked them only
+    // inside epoll_pwait; but the kernel returns ready events in preference
+    // to EINTR, so a client that kept any fd busy could postpone shutdown
+    // forever.)
+    sigset_t stop_signals;
+    sigemptyset(&stop_signals);
+    sigaddset(&stop_signals, SIGINT);
+    sigaddset(&stop_signals, SIGTERM);
+    sigprocmask(SIG_BLOCK, &stop_signals, nullptr); // deliver via signal_fd only
+    signal_fd = signalfd(-1, &stop_signals, SFD_NONBLOCK | SFD_CLOEXEC);
+    if (signal_fd < 0) {
+        perror("signalfd");
+        return 1;
+    }
 
     adjust_fd_limit();
     spare_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
@@ -521,6 +553,11 @@ int main(int argc, char** argv) {
         perror("epoll_ctl ADD listen");
         return 1;
     }
+    ev.data.fd = signal_fd;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, signal_fd, &ev) < 0) {
+        perror("epoll_ctl ADD signalfd");
+        return 1;
+    }
 
     std::printf("lite-redis listening on port %d (epoll, max %d clients)\n", port, max_clients);
 
@@ -528,12 +565,14 @@ int main(int argc, char** argv) {
     while (!stop_requested) {
         // Sleep until at least one fd is ready. Timeout -1 = wait forever.
         // (Stage 5 replaces -1 with "time until the next key expires".)
-        int n = epoll_pwait(epfd, events, MAX_EVENTS, -1, &wait_mask);
+        int timeout = listener_disarmed ? LISTENER_RETRY_MS : -1;
+        int n = epoll_wait(epfd, events, MAX_EVENTS, timeout);
         if (n < 0) {
-            if (errno == EINTR) continue; // a signal: loop re-checks stop_requested
+            if (errno == EINTR) continue; // e.g. SIGSTOP/SIGCONT from a debugger
             perror("epoll_wait");
             return 1;
         }
+        if (listener_disarmed) set_listener(true); // retry accepting
 
         for (int i = 0; i < n; i++) {
             int fd = events[i].data.fd;
@@ -542,6 +581,11 @@ int main(int argc, char** argv) {
             if (fd == listen_fd) {
                 handle_accept();
                 continue;
+            }
+            if (fd == signal_fd) {
+                signalfd_siginfo si;
+                while (read(signal_fd, &si, sizeof(si)) == sizeof(si)) stop_requested = true;
+                continue; // finish this batch, then the loop condition stops us
             }
 
             // An earlier event in this same batch may have closed this fd.
@@ -572,6 +616,7 @@ int main(int argc, char** argv) {
     conns.clear();
     conns.shrink_to_fit();
     close(listen_fd);
+    close(signal_fd);
     close(epfd);
     if (spare_fd >= 0) close(spare_fd);
     return 0;

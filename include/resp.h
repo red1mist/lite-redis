@@ -31,12 +31,12 @@ namespace resp {
 // memory just by sending a huge length header.
 constexpr size_t MAX_BULK_LEN = 512 * 1024 * 1024;
 constexpr size_t MAX_ARGS = 1024 * 1024;
-// An inline command longer than this without a newline is garbage, not a
-// command still in flight (same limit as Redis).
+// An inline command, or a "*<n>" / "$<n>" header line, longer than this
+// without its line ending is garbage, not something still in flight (same
+// limit as Redis's PROTO_INLINE_MAX_SIZE). The decision depends only on the
+// line's length, never on how TCP happened to split it, so a given byte
+// stream always gets the same reply.
 constexpr size_t MAX_INLINE_LEN = 64 * 1024;
-// A "*<n>" / "$<n>" header holds at most a sign and 19 digits. Anything much
-// longer without CRLF is garbage; rejecting early keeps re-scanning cheap.
-constexpr size_t MAX_HEADER_LEN = 32;
 
 enum class ParseStatus {
     Ok,          // one full command parsed
@@ -58,6 +58,10 @@ enum class ParseStatus {
 struct ParseState {
     long long remaining = -1; // args still to read; -1 = "*<n>" header not read yet
     size_t pos = 0;           // bytes of this command fully parsed so far
+    // While waiting for a line ending (header or inline line): offset up to
+    // which we've already searched without finding it, so a long line
+    // trickling in is scanned once, not once per read.
+    size_t scanned = 0;
     std::vector<std::pair<size_t, size_t>> spans; // (offset, length) of each arg found
     // Inline commands with quotes/escapes ("a\x41") can't be views into the
     // raw bytes, so their unescaped args live here.
@@ -66,6 +70,7 @@ struct ParseState {
     void reset() {
         remaining = -1;
         pos = 0;
+        scanned = 0;
         spans.clear(); // keeps capacity: no reallocation for the next command
     }
 };
@@ -88,7 +93,7 @@ ParseStatus parse_command(std::string_view buf, ParseState& st,
 
 // Reply encoders: append one RESP value to `out`.
 void add_simple(std::string& out, std::string_view s);  // must not contain \r\n
-void add_error(std::string& out, std::string_view msg); // CR/LF replaced by spaces
+void add_error(std::string& out, std::string_view msg); // CR, LF, NUL -> spaces
 void add_integer(std::string& out, long long n);
 void add_bulk(std::string& out, std::string_view s);
 void add_null(std::string& out);

@@ -97,19 +97,24 @@ bool split_inline(std::string_view line, std::vector<std::string>& out) {
 // Real Redis accepts these so you can poke a server with telnet/nc.
 ParseStatus parse_inline(std::string_view buf, ParseState& st, std::vector<std::string_view>& args,
                          size_t& consumed, std::string& err) {
-    // st.pos = how many bytes we've already searched without finding '\n'.
-    size_t nl = buf.find('\n', st.pos);
+    // Only look for the newline within the first MAX_INLINE_LEN + 1 bytes,
+    // resuming where the last search stopped (st.scanned).
+    size_t limit = std::min(buf.size(), MAX_INLINE_LEN + 1);
+    size_t nl = buf.substr(0, limit).find('\n', st.scanned);
     if (nl == std::string_view::npos) {
-        if (buf.size() > MAX_INLINE_LEN) {
+        if (limit > MAX_INLINE_LEN) {
             err = "too big inline request";
             return ParseStatus::Error;
         }
-        st.pos = buf.size();
+        st.scanned = limit;
         return ParseStatus::Incomplete;
     }
     std::string_view line = buf.substr(0, nl);
     if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
-    // Like Redis (C strings under the hood), a NUL byte ends the line.
+    // A NUL byte ends the line's content. (Intentional difference: Redis
+    // searches for the newline with strchr, which stops AT the NUL, so it
+    // never sees the newline and waits for more data. We run the part before
+    // the NUL instead of stalling.)
     line = line.substr(0, std::min(line.size(), line.find('\0')));
 
     st.inline_args.clear();
@@ -126,18 +131,28 @@ ParseStatus parse_inline(std::string_view buf, ParseState& st, std::vector<std::
 
 // Reads a "<prefix><integer>\r\n" header line starting at `pos`.
 // On success advances `pos` past the CRLF; otherwise leaves it unchanged.
+// `scanned` remembers how far a previous call already searched for the CRLF
+// (so a header trickling in isn't re-scanned from its start every read).
 // `what` names it in "invalid <what> length"; `big` in "too big <big> count
 // string" (Redis's exact wording: "multibulk" vs "mbulk").
-ParseStatus read_header(std::string_view buf, size_t& pos, long long& value, std::string& err,
-                        const char* what, const char* big) {
-    size_t eol = buf.find("\r\n", pos);
+//
+// Intentional difference: we require a real "\r\n". Redis finds the first
+// '\r' and skips whatever single byte follows it.
+ParseStatus read_header(std::string_view buf, size_t& pos, size_t& scanned, long long& value,
+                        std::string& err, const char* what, const char* big) {
+    // The CRLF must start within MAX_INLINE_LEN bytes of the header start.
+    size_t limit = std::min(buf.size(), pos + MAX_INLINE_LEN + 2);
+    size_t from = std::max(pos, scanned > 0 ? scanned - 1 : 0); // a '\r' may end the last scan
+    size_t eol = buf.substr(0, limit).find("\r\n", from);
     if (eol == std::string_view::npos) {
-        if (buf.size() - pos > MAX_HEADER_LEN) {
+        if (limit - pos > MAX_INLINE_LEN + 1) {
             err = std::string("too big ") + big + " count string";
             return ParseStatus::Error;
         }
+        scanned = limit;
         return ParseStatus::Incomplete;
     }
+    scanned = 0;
     if (!parse_int(buf.substr(pos + 1, eol - pos - 1), value)) {
         err = std::string("invalid ") + what + " length";
         return ParseStatus::Error;
@@ -159,7 +174,7 @@ ParseStatus parse_command(std::string_view buf, ParseState& st,
     size_t pos = st.pos; // resume where the previous call stopped
     if (st.remaining < 0) {
         long long n;
-        if (auto r = read_header(buf, pos, n, err, "multibulk", "mbulk"); r != ParseStatus::Ok)
+        if (auto r = read_header(buf, pos, st.scanned, n, err, "multibulk", "mbulk"); r != ParseStatus::Ok)
             return r;
         if (n > static_cast<long long>(MAX_ARGS)) {
             err = "invalid multibulk length";
@@ -181,7 +196,7 @@ ParseStatus parse_command(std::string_view buf, ParseState& st,
             return ParseStatus::Error;
         }
         long long len;
-        if (auto r = read_header(buf, pos, len, err, "bulk", "bulk"); r != ParseStatus::Ok)
+        if (auto r = read_header(buf, pos, st.scanned, len, err, "bulk", "bulk"); r != ParseStatus::Ok)
             return r; // header incomplete: st.pos still points at this '$'
         if (len < 0 || len > static_cast<long long>(MAX_BULK_LEN)) {
             err = "invalid bulk length";
@@ -225,8 +240,9 @@ void add_error(std::string& out, std::string_view msg) {
     // command names, a bad byte in a protocol error), and a CR or LF in there
     // would end the line early and let the rest be parsed as a separate,
     // forged reply. Neutralize them.
+    // (NUL too: clients that treat error text as a C string would truncate.)
     for (size_t i = start; i < out.size(); i++)
-        if (out[i] == '\r' || out[i] == '\n') out[i] = ' ';
+        if (out[i] == '\r' || out[i] == '\n' || out[i] == '\0') out[i] = ' ';
     out += "\r\n";
 }
 

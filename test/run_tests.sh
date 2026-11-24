@@ -54,10 +54,31 @@ echo "== graceful shutdown + LeakSanitizer =="
 # LeakSanitizer then scans the heap at exit and reports any leaked block.
 redis-cli -p "$PORT" SET leakcheck:key value >/dev/null   # leave data + a live client around
 exec 3<>/dev/tcp/127.0.0.1/"$PORT"                       # an idle connection at shutdown
+# ...and a client that keeps the server busy non-stop: shutdown must not wait
+# for it to go quiet (it used to, while any fd stayed continuously ready).
+python3 - "$PORT" <<'PY' &
+import socket, sys, threading, time
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
+def drain():
+    try:
+        while s.recv(1 << 16): pass
+    except OSError: pass
+threading.Thread(target=drain, daemon=True).start()
+end = time.time() + 30
+try:
+    while time.time() < end: s.sendall(b"PING\r\n" * 20000)
+except OSError: pass
+PY
+STREAMER=$!
+sleep 1
+T0=$(date +%s%N)
 kill -TERM $PID
 wait $PID; rc=$?
+T1=$(date +%s%N)
+kill $STREAMER 2>/dev/null; wait $STREAMER 2>/dev/null
 exec 3>&-
 expect_eq "exit status after SIGTERM" "0" "$rc"
+expect_eq "prompt shutdown under load (<2s)" "yes" "$( [ $(( (T1 - T0) / 1000000 )) -lt 2000 ] && echo yes || echo "no ($(( (T1 - T0) / 1000000 )) ms)")"
 expect_eq "logged shutdown" "1" "$(grep -c 'shutting down' "$LOG")"
 if grep -qE "AddressSanitizer|LeakSanitizer" "$LOG"; then
     echo "FAIL sanitizer report:"; grep -A25 -E "AddressSanitizer|LeakSanitizer" "$LOG" | head -60; fail=1
@@ -106,6 +127,35 @@ PY
 expect_eq "rejection log is rate-limited (lines)" "1" "$(grep -c 'max number of clients' "$LIM_LOG")"
 kill -TERM $LPID; wait $LPID
 rm -f "$LIM_LOG"
+
+# Hard fd limit so low that EMFILE happens with nobody queued (Linux
+# allocates the fd before checking the backlog). 7 fds are in use at startup
+# (stdio, spare, listener, signalfd, epoll), so with 8 the first client takes
+# the last one. The listener must stay usable: the next client gets the
+# max-clients error, not silence.
+( ulimit -n 8; exec $BIN --port "$LIM_PORT" --maxclients 1 ) >/dev/null 2>&1 &
+LPID=$!
+for _ in $(seq 50); do redis-cli -p "$LIM_PORT" PING >/dev/null 2>&1 && break; sleep 0.1; done
+python3 - "$LIM_PORT" <<'PY'
+import socket, sys
+port = int(sys.argv[1])
+def ping(s):
+    s.sendall(b"PING\r\n"); return s.recv(100)
+a = socket.create_connection(("127.0.0.1", port), timeout=3); ra = ping(a)
+b = socket.create_connection(("127.0.0.1", port), timeout=3)
+try: rb = ping(b)
+except socket.timeout: rb = b"<timeout>"
+a.close(); b.close()
+import time; time.sleep(0.3)
+c = socket.create_connection(("127.0.0.1", port), timeout=3)
+try: rc = ping(c)
+except socket.timeout: rc = b"<timeout>"
+ok = ra == b"+PONG\r\n" and rb.startswith(b"-ERR max number of clients") and rc == b"+PONG\r\n"
+print(("PASS" if ok else "FAIL") + f" EMFILE with empty backlog: A={ra!r} B={rb!r} C={rc!r}")
+sys.exit(0 if ok else 1)
+PY
+[ $? -eq 0 ] || fail=1
+kill -TERM $LPID; wait $LPID
 
 echo
 echo "== differential: same tests against real redis-server =="

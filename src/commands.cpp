@@ -225,16 +225,20 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
 // Same wording as Redis 7: the args part shares ONE ~128-byte budget (each
 // arg is cut to whatever room is left), so the message stays short no matter
 // how many or how long the args are. CR/LF are neutralized by add_error.
+// Redis formats these with printf's %s, which stops at a NUL byte, so each
+// name/arg is cut at its first NUL before the length limits apply.
+std::string_view until_nul(std::string_view s) { return s.substr(0, s.find('\0')); }
+
 void unknown_command(const Args& args, CommandContext& ctx) {
     std::string arglist;
     for (size_t i = 1; i < args.size() && arglist.size() < 128; i++) {
         size_t room = 128 - arglist.size();
         arglist += '\'';
-        arglist.append(args[i].substr(0, room));
+        arglist.append(until_nul(args[i]).substr(0, room));
         arglist += "' ";
     }
     std::string msg = "ERR unknown command '";
-    msg.append(args[0].substr(0, 128));
+    msg.append(until_nul(args[0]).substr(0, 128));
     msg += "', with args beginning with: ";
     msg += arglist;
     resp::add_error(ctx.out, msg);
