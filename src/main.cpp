@@ -1,101 +1,300 @@
+// Stage 2: single-threaded, non-blocking echo server driven by epoll.
+//
+// Still an echo server: whatever a client sends comes straight back. What
+// changed from Stage 1 is HOW we serve clients: one thread now juggles any
+// number of connections by asking the kernel "which sockets are ready?"
+// (epoll_wait) and only ever touching sockets that won't block.
+
 #include <arpa/inet.h>
+#include <cerrno>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <fcntl.h>
+#include <memory>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <signal.h>
+#include <string>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <vector>
 
 constexpr int PORT = 6379;
-constexpr int BACKLOG = 16;
+// Max pending connections the kernel queues before we accept() them. The
+// kernel silently caps this at /proc/sys/net/core/somaxconn. redis-benchmark
+// opens 50 connections at once by default, so 16 (Stage 1) is too small.
+constexpr int BACKLOG = 511;
+constexpr int MAX_EVENTS = 256;          // events returned per epoll_wait call
+constexpr size_t READ_CHUNK = 64 * 1024; // bytes per read() syscall
+// Backpressure: if a client sends faster than it reads its replies, its
+// output buffer grows without bound. Past this size we stop reading from it
+// until the buffer drains (see update_interest).
+constexpr size_t MAX_WBUF = 1024 * 1024;
+
+// Per-connection state. TCP is a byte stream, not a message queue: one read()
+// may return half a command or several commands, and one write() may accept
+// only part of a reply. So every client keeps its own buffers that survive
+// between event-loop iterations.
+struct Conn {
+    int fd;
+    std::string addr;   // "ip:port", for logging
+    std::string rbuf;   // bytes received, not yet processed (used from Stage 3)
+    std::string wbuf;   // bytes queued for sending
+    size_t wpos = 0;    // how much of wbuf has already been sent
+    uint32_t interest = 0; // events currently registered with epoll
+};
+
+// Indexed by fd. The kernel always hands out the lowest free fd number, so
+// fds stay small and dense and a vector gives O(1) lookup with no hashing.
+static std::vector<std::unique_ptr<Conn>> conns;
+static int epfd = -1;
+
+static bool set_nonblocking(int fd) {
+    // O_NONBLOCK changes what read/write/accept do when they can't make
+    // progress: instead of putting the thread to sleep they return -1 with
+    // errno = EAGAIN (== EWOULDBLOCK on Linux), and we go serve someone else.
+    int flags = fcntl(fd, F_GETFL, 0);
+    return flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
+}
+
+static size_t pending_output(const Conn& c) { return c.wbuf.size() - c.wpos; }
+
+// Level-triggered epoll (the default, no EPOLLET): epoll_wait keeps reporting
+// a socket as long as the condition holds (unread data / room to write). That
+// means we don't have to drain a socket to EAGAIN on every wakeup: leftovers
+// are simply reported again next iteration. With edge-triggered we'd be
+// notified only on state *changes* and would have to loop until EAGAIN or
+// risk never hearing about that socket again.
+//
+// Which events we ask for is derived purely from the connection's state:
+//   - EPOLLIN unless the output buffer is over MAX_WBUF (backpressure).
+//   - EPOLLOUT only while there is unsent output. Asking for EPOLLOUT all the
+//     time would be a busy loop: an idle socket is almost always writable.
+static void update_interest(Conn& c) {
+    uint32_t want = 0;
+    if (pending_output(c) < MAX_WBUF) want |= EPOLLIN;
+    if (pending_output(c) > 0) want |= EPOLLOUT;
+    if (want == c.interest) return; // skip a pointless epoll_ctl syscall
+
+    epoll_event ev{};
+    ev.events = want;
+    ev.data.fd = c.fd;
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD, c.fd, &ev) < 0) perror("epoll_ctl MOD");
+    c.interest = want;
+}
+
+static void close_conn(int fd) {
+    std::printf("client disconnected: %s\n", conns[fd]->addr.c_str());
+    // Order matters only for clarity: close() would also drop the fd from the
+    // epoll set. Forgetting close() entirely leaks the fd; enough of those
+    // and accept() fails with EMFILE ("Too many open files", ulimit -n).
+    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+    close(fd);
+    conns[fd].reset(); // frees the Conn and its buffers
+}
+
+static void handle_accept(int listen_fd) {
+    // Several clients may be queued behind a single readiness notification,
+    // so keep accepting until the backlog is empty (EAGAIN).
+    while (true) {
+        sockaddr_in client_addr{};
+        socklen_t len = sizeof(client_addr);
+        // accept4 with SOCK_NONBLOCK sets O_NONBLOCK atomically, saving the
+        // two fcntl() calls set_nonblocking would cost per connection.
+        int fd = accept4(listen_fd, reinterpret_cast<sockaddr*>(&client_addr), &len,
+                         SOCK_NONBLOCK | SOCK_CLOEXEC);
+        if (fd < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return; // backlog drained
+            if (errno == EINTR || errno == ECONNABORTED) continue;
+            // EMFILE/ENFILE: out of fds. The pending connection stays in the
+            // backlog and level-triggered epoll will report it again.
+            perror("accept4");
+            return;
+        }
+
+        // Disable Nagle's algorithm. Nagle holds back small writes hoping to
+        // coalesce them; combined with the client's delayed ACKs that can add
+        // ~40ms to a tiny reply. Redis replies are tiny, so we want them sent
+        // immediately. (Real Redis does the same.)
+        int one = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+        char ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &client_addr.sin_addr, ip, sizeof(ip));
+
+        auto c = std::make_unique<Conn>();
+        c->fd = fd;
+        c->addr = std::string(ip) + ":" + std::to_string(ntohs(client_addr.sin_port));
+        c->interest = EPOLLIN;
+
+        epoll_event ev{};
+        ev.events = EPOLLIN;
+        ev.data.fd = fd;
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) < 0) {
+            perror("epoll_ctl ADD");
+            close(fd);
+            continue;
+        }
+
+        if (static_cast<size_t>(fd) >= conns.size()) conns.resize(fd + 1);
+        std::printf("client connected: %s\n", c->addr.c_str());
+        conns[fd] = std::move(c);
+    }
+}
+
+// Returns false if the connection was closed.
+static bool handle_write(Conn& c) {
+    while (pending_output(c) > 0) {
+        // write() may accept only PART of what we ask (the kernel's socket
+        // send buffer is finite). This is the bug Stage 1 had: it assumed one
+        // write() sends everything.
+        ssize_t n = write(c.fd, c.wbuf.data() + c.wpos, pending_output(c));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break; // send buffer full
+            // EPIPE / ECONNRESET: peer is gone. (EPIPE, not a SIGPIPE crash,
+            // because main() ignores SIGPIPE.)
+            close_conn(c.fd);
+            return false;
+        }
+        c.wpos += static_cast<size_t>(n);
+    }
+    // Track progress with an offset instead of erasing the sent prefix after
+    // every write (erase would shift the remaining bytes: O(n) per call).
+    // Reset only once everything is out.
+    if (pending_output(c) == 0) {
+        c.wbuf.clear();
+        c.wpos = 0;
+    }
+    update_interest(c);
+    return true;
+}
+
+static void handle_read(Conn& c) {
+    // One read() per wakeup is enough under level-triggered epoll: anything
+    // left in the socket gets reported again on the next epoll_wait. It also
+    // keeps one chatty client from starving the others.
+    char buf[READ_CHUNK];
+    ssize_t n = read(c.fd, buf, sizeof(buf));
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return;
+        close_conn(c.fd); // ECONNRESET etc.
+        return;
+    }
+    if (n == 0) {         // EOF: peer closed its end
+        close_conn(c.fd);
+        return;
+    }
+
+    // Echo: queue the bytes for sending. From Stage 3 on, bytes go to rbuf,
+    // get parsed as RESP commands, and replies are appended to wbuf instead.
+    c.wbuf.append(buf, static_cast<size_t>(n));
+
+    // Try to send right away rather than waiting for an EPOLLOUT round trip:
+    // the socket is almost always writable, so this usually finishes the
+    // reply in the same iteration. Only leftovers wait for EPOLLOUT.
+    handle_write(c);
+}
 
 int main() {
     // stdout is fully-buffered (not line-buffered) whenever it isn't a
-    // terminal — e.g. redirected to a file or piped. Without this, our log
-    // lines sit in a buffer and never reach disk until the process exits
-    // cleanly, which makes a killed/crashed server look like it logged
-    // nothing at all.
+    // terminal; line-buffer it so logs show up even if we're killed.
     setvbuf(stdout, nullptr, _IOLBF, 0);
 
-    // write() to a socket the peer already closed raises SIGPIPE, and the
-    // default disposition for that signal is to kill the process. We'd
-    // rather get an EPIPE error back from write() and handle it in code.
+    // write() to a socket the peer already closed raises SIGPIPE, whose
+    // default action kills the process. Ignore it and handle EPIPE instead.
     signal(SIGPIPE, SIG_IGN);
 
-    // AF_INET = IPv4, SOCK_STREAM = TCP (reliable, ordered byte stream).
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
         perror("socket");
         return 1;
     }
 
-    // Without this, restarting the server right after killing it fails with
-    // "Address already in use" — the OS holds the port in TIME_WAIT for a
-    // while after the last connection on it closes.
+    // Allow immediate restart: otherwise bind() fails with "Address already in
+    // use" while the old port sits in TIME_WAIT.
     int opt = 1;
     setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    // Network byte order is big-endian; x86/ARM are little-endian, so port
-    // and address numbers must be byte-swapped with htons/htonl before they
-    // go into a struct the kernel/network will read.
-    addr.sin_port = htons(PORT);
-    addr.sin_addr.s_addr = htonl(INADDR_ANY); // listen on all local interfaces
+    addr.sin_port = htons(PORT);                 // host -> network byte order
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);    // all local interfaces
 
     if (bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
         perror("bind");
         return 1;
     }
-
-    // backlog = max pending connections the kernel will queue before we
-    // accept() them.
     if (listen(listen_fd, BACKLOG) < 0) {
         perror("listen");
         return 1;
     }
-
-    std::printf("lite-redis listening on port %d (echo mode)\n", PORT);
-
-    while (true) {
-        sockaddr_in client_addr{};
-        socklen_t client_len = sizeof(client_addr);
-
-        // accept() blocks until a client connects, then returns a NEW fd
-        // dedicated to that one client. listen_fd keeps listening for the
-        // next connection — it's never used for reading/writing data.
-        int client_fd = accept(listen_fd, reinterpret_cast<sockaddr*>(&client_addr), &client_len);
-        if (client_fd < 0) {
-            perror("accept");
-            continue;
-        }
-
-        char ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &client_addr.sin_addr, ip, sizeof(ip));
-        std::printf("client connected: %s:%d\n", ip, ntohs(client_addr.sin_port));
-
-        // Blocking model: while this client is connected, we serve nobody
-        // else. A second client's connection just sits in the kernel's
-        // backlog queue until we come back around to accept() again.
-        char buf[4096];
-        while (true) {
-            ssize_t n = read(client_fd, buf, sizeof(buf));
-            if (n <= 0) {
-                // n == 0 means the peer closed the connection cleanly;
-                // n < 0 means an error.
-                break;
-            }
-            ssize_t written = write(client_fd, buf, static_cast<size_t>(n));
-            if (written < 0) {
-                perror("write");
-                break;
-            }
-        }
-
-        std::printf("client disconnected: %s:%d\n", ip, ntohs(client_addr.sin_port));
-        close(client_fd);
+    // The listening socket must be non-blocking too, otherwise the accept()
+    // loop in handle_accept would block once the backlog is empty.
+    if (!set_nonblocking(listen_fd)) {
+        perror("fcntl");
+        return 1;
     }
 
-    close(listen_fd);
-    return 0;
+    // epoll instance: a kernel object holding the set of fds we care about.
+    // Unlike select/poll, we register each fd ONCE (epoll_ctl) instead of
+    // passing the whole list on every call, and epoll_wait returns only the
+    // fds that are ready. So the per-wakeup cost scales with the number of
+    // READY sockets, not the number of connected ones.
+    epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (epfd < 0) {
+        perror("epoll_create1");
+        return 1;
+    }
+    epoll_event ev{};
+    ev.events = EPOLLIN;
+    ev.data.fd = listen_fd;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, listen_fd, &ev) < 0) {
+        perror("epoll_ctl ADD listen");
+        return 1;
+    }
+
+    std::printf("lite-redis listening on port %d (echo mode, epoll)\n", PORT);
+
+    epoll_event events[MAX_EVENTS];
+    while (true) {
+        // Sleep until at least one fd is ready. Timeout -1 = wait forever.
+        // (Stage 5 replaces -1 with "time until the next key expires".)
+        int n = epoll_wait(epfd, events, MAX_EVENTS, -1);
+        if (n < 0) {
+            if (errno == EINTR) continue; // interrupted by a signal; retry
+            perror("epoll_wait");
+            return 1;
+        }
+
+        for (int i = 0; i < n; i++) {
+            int fd = events[i].data.fd;
+            uint32_t e = events[i].events;
+
+            if (fd == listen_fd) {
+                handle_accept(listen_fd);
+                continue;
+            }
+
+            // An earlier event in this same batch may have closed this fd.
+            if (static_cast<size_t>(fd) >= conns.size() || !conns[fd]) continue;
+            Conn& c = *conns[fd];
+
+            // EPOLLERR/EPOLLHUP are always reported, even if not requested.
+            // Only bail out if there's nothing left to read: a peer can send
+            // data and then close, and we still want to process that data.
+            if ((e & (EPOLLERR | EPOLLHUP)) && !(e & EPOLLIN)) {
+                close_conn(fd);
+                continue;
+            }
+            if (e & EPOLLOUT) {
+                if (!handle_write(c)) continue; // closed
+            }
+            if (e & EPOLLIN) {
+                handle_read(c);
+            }
+        }
+    }
 }

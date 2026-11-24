@@ -8,7 +8,7 @@ FROM ubuntu:24.04
 
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      clang make \
+      clang libclang-rt-18-dev make \
       valgrind gdb strace \
       redis-tools redis-server \
       python3 \

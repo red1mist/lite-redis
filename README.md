@@ -10,7 +10,7 @@ no threads, no external libraries, just POSIX sockets and Linux `epoll`.
 - [x] Stage 0 — project scaffolding
 - [x] Stage 1 — blocking single-client TCP echo server
 - [x] Stage 1.5 — Linux dev container
-- [ ] Stage 2 — non-blocking I/O + `epoll` event loop (concurrent clients)
+- [x] Stage 2 — non-blocking I/O + `epoll` event loop (concurrent clients)
 - [ ] Stage 3 — RESP protocol parser (`redis-cli` compatible)
 - [ ] Stage 4 — key-value store: `SET`, `GET`, `DEL`
 - [ ] Stage 5 — key expiry: `EXPIRE`, `TTL` (min-heap timer + lazy deletion)
