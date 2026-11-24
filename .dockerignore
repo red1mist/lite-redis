@@ -1,0 +1,2 @@
+# The image only needs the Dockerfile; source is bind-mounted at runtime.
+*

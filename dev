@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Run a command inside the long-lived Linux dev container.
+#
+#   ./dev                 interactive shell
+#   ./dev make            build
+#   ./dev make run        start the server (blocks; use a second terminal for clients)
+#   ./dev redis-cli       talk to the server
+#
+# Every ./dev call execs into the SAME container, so a server started in one
+# terminal is reachable on 127.0.0.1:6379 from redis-cli / redis-benchmark in
+# another. Benchmark from inside the container: going through Docker Desktop's
+# port forwarding from macOS adds latency that has nothing to do with our code.
+#
+#   ./dev --rebuild       rebuild the image (after editing the Dockerfile)
+#   ./dev --stop          remove the container
+set -euo pipefail
+
+IMAGE=lite-redis-dev
+CONTAINER=lite-redis-dev
+cd "$(dirname "$0")"
+
+case "${1:-}" in
+  --stop)
+    docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+    exit 0
+    ;;
+  --rebuild)
+    docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+    docker build -t "$IMAGE" .
+    exit 0
+    ;;
+esac
+
+if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+  docker build -t "$IMAGE" .
+fi
+
+if [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" != "true" ]; then
+  docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+  # --cap-add SYS_PTRACE lets gdb/strace attach to processes.
+  docker run -d --name "$CONTAINER" \
+    -v "$PWD":/work -w /work \
+    -p 6379:6379 \
+    --cap-add SYS_PTRACE \
+    "$IMAGE" sleep infinity >/dev/null
+fi
+
+[ $# -eq 0 ] && set -- bash
+
+# Allocate a TTY only when we have one (so scripts/CI can call ./dev too).
+if [ -t 0 ] && [ -t 1 ]; then
+  exec docker exec -it "$CONTAINER" "$@"
+else
+  exec docker exec -i "$CONTAINER" "$@"
+fi
