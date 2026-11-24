@@ -9,7 +9,7 @@ OBJ := $(SRC:src/%.cpp=$(OBJ_DIR)/%.o)
 BIN := lite-redis-server
 DEBUG_BIN := lite-redis-server-debug
 
-.PHONY: all debug clean run run-debug
+.PHONY: all debug clean run run-debug test
 
 # Default target: optimized build, used when you just run `make`.
 all: CXXFLAGS += -O2
@@ -28,8 +28,12 @@ debug: LDFLAGS += -fsanitize=address
 debug:
 	$(CXX) $(CXXFLAGS) -o $(DEBUG_BIN) $(SRC) $(LDFLAGS)
 
+# -MMD -MP: also emit build/foo.d listing the headers foo.cpp includes, so
+# editing a header rebuilds every .o that depends on it (included below).
 $(OBJ_DIR)/%.o: src/%.cpp | $(OBJ_DIR)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
+
+-include $(OBJ:.o=.d)
 
 $(OBJ_DIR):
 	mkdir -p $(OBJ_DIR)
@@ -42,3 +46,7 @@ run-debug: debug
 
 clean:
 	rm -rf $(OBJ_DIR) $(BIN) $(DEBUG_BIN) $(DEBUG_BIN).dSYM
+
+# Builds the ASan binary, runs it on a spare port, runs all tests against it.
+test: debug
+	./test/run_tests.sh

@@ -1,14 +1,19 @@
-// Stage 2: single-threaded, non-blocking echo server driven by epoll.
+// lite-redis server: single-threaded, non-blocking, driven by epoll.
 //
-// Still an echo server: whatever a client sends comes straight back. What
-// changed from Stage 1 is HOW we serve clients: one thread now juggles any
-// number of connections by asking the kernel "which sockets are ready?"
-// (epoll_wait) and only ever touching sockets that won't block.
+// One thread juggles any number of connections by asking the kernel "which
+// sockets are ready?" (epoll_wait) and only ever touching sockets that won't
+// block. Bytes read from a client are parsed as RESP commands (resp.cpp),
+// executed (commands.cpp), and the replies queued in that client's output
+// buffer.
+
+#include "commands.h"
+#include "resp.h"
 
 #include <arpa/inet.h>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <memory>
@@ -21,7 +26,7 @@
 #include <unistd.h>
 #include <vector>
 
-constexpr int PORT = 6379;
+constexpr int DEFAULT_PORT = 6379;
 // Max pending connections the kernel queues before we accept() them. The
 // kernel silently caps this at /proc/sys/net/core/somaxconn. redis-benchmark
 // opens 50 connections at once by default, so 16 (Stage 1) is too small.
@@ -40,10 +45,13 @@ constexpr size_t MAX_WBUF = 1024 * 1024;
 struct Conn {
     int fd;
     std::string addr;   // "ip:port", for logging
-    std::string rbuf;   // bytes received, not yet processed (used from Stage 3)
+    std::string rbuf;   // bytes received but not yet parsed into a full command
     std::string wbuf;   // bytes queued for sending
     size_t wpos = 0;    // how much of wbuf has already been sent
     uint32_t interest = 0; // events currently registered with epoll
+    // Set after QUIT, a protocol error, or EOF from the client: stop reading,
+    // flush whatever replies are still queued, then close.
+    bool closing = false;
 };
 
 // Indexed by fd. The kernel always hands out the lowest free fd number, so
@@ -74,7 +82,10 @@ static size_t pending_output(const Conn& c) { return c.wbuf.size() - c.wpos; }
 //     time would be a busy loop: an idle socket is almost always writable.
 static void update_interest(Conn& c) {
     uint32_t want = 0;
-    if (pending_output(c) < MAX_WBUF) want |= EPOLLIN;
+    // A closing connection must not ask for EPOLLIN: after EOF the socket is
+    // permanently "readable" (read returns 0), so level-triggered epoll would
+    // wake us for it on every iteration.
+    if (!c.closing && pending_output(c) < MAX_WBUF) want |= EPOLLIN;
     if (pending_output(c) > 0) want |= EPOLLOUT;
     if (want == c.interest) return; // skip a pointless epoll_ctl syscall
 
@@ -162,14 +173,61 @@ static bool handle_write(Conn& c) {
         c.wpos += static_cast<size_t>(n);
     }
     // Track progress with an offset instead of erasing the sent prefix after
-    // every write (erase would shift the remaining bytes: O(n) per call).
-    // Reset only once everything is out.
+    // every write (erase shifts the remaining bytes: O(n) per call).
     if (pending_output(c) == 0) {
         c.wbuf.clear();
+        c.wpos = 0;
+        if (c.closing) { // everything flushed; now we can hang up
+            close_conn(c.fd);
+            return false;
+        }
+    } else if (c.wpos >= 64 * 1024 && c.wpos * 2 >= c.wbuf.size()) {
+        // A client that keeps pipelining may never let wbuf fully drain, so
+        // "clear when empty" alone would let the already-sent prefix pile up
+        // forever. Drop it once it's at least half the buffer: each byte is
+        // moved at most about once, so this stays amortized O(1) per byte.
+        c.wbuf.erase(0, c.wpos);
         c.wpos = 0;
     }
     update_interest(c);
     return true;
+}
+
+// Parse and execute every COMPLETE command sitting in rbuf. A trailing
+// partial command stays in rbuf until the rest of its bytes arrive.
+//
+// Pipelining falls out of this naturally: if a client sends 16 commands in
+// one packet, a single read() returns all 16, we run them back to back, and
+// their 16 replies go out in a single write(). That is why redis-benchmark -P
+// (pipelining) multiplies throughput: syscalls, not command execution, are
+// the expensive part.
+static void process_input(Conn& c) {
+    static std::vector<std::string_view> args; // reused: no allocation per command
+    std::string err;
+    size_t pos = 0;
+
+    while (!c.closing) {
+        size_t used;
+        auto st = resp::parse_command(std::string_view(c.rbuf).substr(pos), args, used, err);
+        if (st == resp::ParseStatus::Incomplete) break;
+        if (st == resp::ParseStatus::Error) {
+            // We can't tell where the next command starts in a corrupt
+            // stream, so (like real Redis) reply with the error and hang up.
+            resp::add_error(c.wbuf, "ERR Protocol error: " + err);
+            c.closing = true;
+            break;
+        }
+        pos += used;
+        if (args.empty()) continue; // blank line / "*0"
+
+        // args point into c.rbuf; replies go to c.wbuf, a different buffer,
+        // so the views stay valid while the command runs.
+        CommandContext ctx{c.wbuf};
+        execute_command(args, ctx);
+        if (ctx.close_after_reply) c.closing = true;
+    }
+    // Drop all consumed bytes with ONE erase per read, not one per command.
+    c.rbuf.erase(0, pos);
 }
 
 static void handle_read(Conn& c) {
@@ -183,22 +241,39 @@ static void handle_read(Conn& c) {
         close_conn(c.fd); // ECONNRESET etc.
         return;
     }
-    if (n == 0) {         // EOF: peer closed its end
-        close_conn(c.fd);
-        return;
+    if (n == 0) {
+        // EOF: the client is done sending (it may have only half-closed, as
+        // `printf 'PING\r\n' | nc` does). Every complete command was already
+        // run when its bytes arrived, so just flush pending replies and close.
+        c.closing = true;
+    } else {
+        c.rbuf.append(buf, static_cast<size_t>(n));
+        process_input(c);
     }
-
-    // Echo: queue the bytes for sending. From Stage 3 on, bytes go to rbuf,
-    // get parsed as RESP commands, and replies are appended to wbuf instead.
-    c.wbuf.append(buf, static_cast<size_t>(n));
 
     // Try to send right away rather than waiting for an EPOLLOUT round trip:
     // the socket is almost always writable, so this usually finishes the
     // reply in the same iteration. Only leftovers wait for EPOLLOUT.
+    // (handle_write also closes the connection if it's closing and drained.)
     handle_write(c);
 }
 
-int main() {
+int main(int argc, char** argv) {
+    // Usage: lite-redis-server [--port N]
+    int port = DEFAULT_PORT;
+    for (int i = 1; i < argc; i++) {
+        if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
+            port = std::atoi(argv[++i]);
+        } else {
+            std::fprintf(stderr, "usage: %s [--port N]\n", argv[0]);
+            return 1;
+        }
+    }
+    if (port <= 0 || port > 65535) {
+        std::fprintf(stderr, "invalid port\n");
+        return 1;
+    }
+
     // stdout is fully-buffered (not line-buffered) whenever it isn't a
     // terminal; line-buffer it so logs show up even if we're killed.
     setvbuf(stdout, nullptr, _IOLBF, 0);
@@ -220,7 +295,7 @@ int main() {
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(PORT);                 // host -> network byte order
+    addr.sin_port = htons(static_cast<uint16_t>(port));                 // host -> network byte order
     addr.sin_addr.s_addr = htonl(INADDR_ANY);    // all local interfaces
 
     if (bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
@@ -256,7 +331,7 @@ int main() {
         return 1;
     }
 
-    std::printf("lite-redis listening on port %d (echo mode, epoll)\n", PORT);
+    std::printf("lite-redis listening on port %d (epoll)\n", port);
 
     epoll_event events[MAX_EVENTS];
     while (true) {

@@ -11,11 +11,20 @@ no threads, no external libraries, just POSIX sockets and Linux `epoll`.
 - [x] Stage 1 — blocking single-client TCP echo server
 - [x] Stage 1.5 — Linux dev container
 - [x] Stage 2 — non-blocking I/O + `epoll` event loop (concurrent clients)
-- [ ] Stage 3 — RESP protocol parser (`redis-cli` compatible)
+- [x] Stage 3 — RESP protocol parser (`redis-cli` compatible)
 - [ ] Stage 4 — key-value store: `SET`, `GET`, `DEL`
 - [ ] Stage 5 — key expiry: `EXPIRE`, `TTL` (min-heap timer + lazy deletion)
 - [ ] Stage 6 — tests + Valgrind leak check under load
 - [ ] Stage 7 — `redis-benchmark` results
+
+## Layout
+
+```
+src/main.cpp      epoll event loop, connections, buffering, backpressure
+src/resp.cpp      incremental RESP parser (partial reads, pipelining) + reply encoders
+src/commands.cpp  command table and handlers
+test/             raw-RESP integration tests + redis-cli smoke test
+```
 
 ## Development
 
@@ -26,6 +35,7 @@ container. The source is bind-mounted, so edit on the host as usual.
 ./dev make            # optimized build -> ./lite-redis-server
 ./dev make debug      # AddressSanitizer build -> ./lite-redis-server-debug
 ./dev make run        # build + start the server on :6379
+./dev make test       # ASan build + integration tests + redis-cli smoke test
 
 # in a second terminal (same container):
 ./dev redis-cli
