@@ -114,6 +114,7 @@ kernel (`read`/`write`/`epoll_wait` and TCP), one read and one write syscall
 per request; pipelining amortizes those syscalls, which is why `-P 16` is 7×
 faster. Caveats: real Redis does much more per command (stats, keyspace
 notifications, persistence/replication hooks, many data types), lite-redis's
-p99 is higher than Redis's in the TTL and 1 KB SET workloads, and plain
+p99 is higher than Redis's in three rows (TTL writes, 1 KB SETs, pipelined
+GETs), and plain
 `redis-benchmark` with its default single client thread tops out at ~260k
 for *both* servers. That run measures the client, not the server.

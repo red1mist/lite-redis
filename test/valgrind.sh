@@ -56,7 +56,7 @@ for _ in $(seq 300); do redis-cli -p "$PORT" PING >/dev/null 2>&1 && break; slee
 redis-cli -p "$PORT" PING >/dev/null || { echo "server did not start"; cat "$LOG"; exit 1; }
 T0=$(date +%s)
 
-step "1. redis-benchmark: PING/SET/GET, 50 keep-alive clients"
+step "1. redis-benchmark: PING_INLINE/PING_MBULK/SET/GET, 50 keep-alive clients"
 bench -t ping,set,get -n 30000 -c 50
 
 step "2. redis-benchmark: SET/GET pipelined (-P 16), random keys"
@@ -142,10 +142,10 @@ leaked_fds=$(grep -E "Open (file descriptor|AF_INET socket) [0-9]+" "$LOG" |
     echo "flags:    --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=all --track-fds=yes"
     echo
     echo "workload (${ELAPSED}s under valgrind):"
-    echo "  1. redis-benchmark PING/SET/GET, 50 clients, 90k requests"
-    echo "  2. redis-benchmark SET/GET -P 16, 100k random keys, 100 B values"
-    echo "  3. SET PX 1500 / EXPIRE / PERSIST on 30k random keys (120k requests, keys expiring mid-run)"
-    echo "  4. 3000 requests each on a fresh TCP connection (-k 0)"
+    echo "  1. redis-benchmark PING_INLINE/PING_MBULK/SET/GET, 30k requests each (120k), 50 keep-alive clients"
+    echo "  2. redis-benchmark SET/GET -P 16, 20 clients, 100k requests each over a 50k-key random keyspace, 100 B values"
+    echo "  3. SET PX 1500 (60k) / EXPIRE (30k) / PERSIST (30k) over a 30k-key random keyspace, keys expiring mid-run"
+    echo "  4. PING_INLINE + PING_MBULK, 3000 each (6000), every request on a fresh TCP connection (-k 0)"
     echo "  5. integration suite: $(tail -1 /tmp/vg-tests.txt)"
     echo "  6. 100k keys expiring together (active expiry)"
     echo "  7. SIGTERM with 10k live keys (5k with TTL), 5 idle clients, 1 client mid-command"

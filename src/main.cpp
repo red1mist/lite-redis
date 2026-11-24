@@ -232,9 +232,11 @@ static void handle_accept() {
             if (errno == EMFILE || errno == ENFILE) {
                 // Out of fds. We can't just return: the connection stays in
                 // the backlog, level-triggered epoll reports the listener
-                // again immediately, and we'd spin at 100% CPU. The classic
-                // fix (libev, nginx): give up the spare fd we kept for this,
-                // accept the connection, tell it why, close it, re-reserve.
+                // again immediately, and we'd spin at 100% CPU. The fix
+                // suggested in libev's documentation: give up the spare fd we
+                // kept for this, accept the connection, tell it why, close
+                // it, re-reserve. (nginx instead stops watching the listener
+                // for a while; that's our fallback below.)
                 log_ratelimited("accept: out of file descriptors; rejecting connections");
                 // (Linux reports EMFILE even when nobody is queued, because it
                 // allocates the fd before looking at the backlog. That's why

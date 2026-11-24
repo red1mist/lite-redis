@@ -414,13 +414,14 @@ void unknown_command(const Args& args, CommandContext& ctx) {
 } // namespace
 
 void execute_command(const Args& args, CommandContext& ctx) {
-    // No command name is longer than 7 chars ("command", "pexpire"); don't lowercase-copy a 100 MB
-    // garbage "name" just to find out it's unknown.
-    if (args[0].size() > 16) {
+    // No command name is longer than 7 chars ("command", "pexpire"); don't
+    // lowercase-copy a 100 MB garbage "name" just to find out it's unknown.
+    // 15 = libstdc++'s inline (SSO) capacity, so the copy below never
+    // touches the heap.
+    if (args[0].size() > 15) {
         unknown_command(args, ctx);
         return;
     }
-    // Short enough to fit std::string's inline (SSO) buffer: no heap allocation.
     std::string name = to_lower(args[0]);
     auto it = command_table().find(name);
     if (it == command_table().end()) {
