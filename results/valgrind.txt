@@ -1,22 +1,22 @@
 lite-redis: Valgrind memcheck under load
-commit:   6dc581d
-date:     2026-11-24 09:45 UTC
+commit:   9912a34
+date:     2026-11-24 10:33 UTC
 platform: Linux aarch64, valgrind-3.22.0, Ubuntu clang version 18.1.3 (1ubuntu1)
 binary:   ./lite-redis-server-vg (-O2 -g, no sanitizers)
 flags:    --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=all --track-fds=yes
 
-workload (35s under valgrind):
-  1. redis-benchmark PING/SET/GET, 50 clients, 90k requests
-  2. redis-benchmark SET/GET -P 16, 100k random keys, 100 B values
-  3. SET PX 1500 / EXPIRE / PERSIST on 30k random keys (120k requests, keys expiring mid-run)
-  4. 3000 requests each on a fresh TCP connection (-k 0)
+workload (34s under valgrind):
+  1. redis-benchmark PING_INLINE/PING_MBULK/SET/GET, 30k requests each (120k), 50 keep-alive clients
+  2. redis-benchmark SET/GET -P 16, 20 clients, 100k requests each over a 50k-key random keyspace, 100 B values
+  3. SET PX 1500 (60k) / EXPIRE (30k) / PERSIST (30k) over a 30k-key random keyspace, keys expiring mid-run
+  4. PING_INLINE + PING_MBULK, 3000 each (6000), every request on a fresh TCP connection (-k 0)
   5. integration suite: [lite] 76/76 passed, 5 skipped
   6. 100k keys expiring together (active expiry)
   7. SIGTERM with 10k live keys (5k with TTL), 5 idle clients, 1 client mid-command
 
 result:
   valgrind exit code: 0 (99 would mean errors or leaks)
-  total heap usage: 407,516 allocs, 407,516 frees, 655,046,924 bytes allocated
+  total heap usage: 408,226 allocs, 408,226 frees, 655,147,653 bytes allocated
   in use at exit: 0 bytes in 0 blocks
   FILE DESCRIPTORS: 4 open (3 std) at exit. (std + valgrind's own log file)
   leaked fds: none
