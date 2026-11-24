@@ -5,10 +5,13 @@
 #include <string_view>
 #include <vector>
 
+#include "store.h"
+
 using Args = std::vector<std::string_view>;
 
 struct CommandContext {
     std::string& out;               // reply bytes are appended here (conn's wbuf)
+    Store& store;                   // the keyspace
     bool close_after_reply = false; // set by QUIT
 };
 

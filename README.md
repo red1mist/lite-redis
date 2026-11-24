@@ -12,7 +12,7 @@ no threads, no external libraries, just POSIX sockets and Linux `epoll`.
 - [x] Stage 1.5 — Linux dev container
 - [x] Stage 2 — non-blocking I/O + `epoll` event loop (concurrent clients)
 - [x] Stage 3 — RESP protocol parser (`redis-cli` compatible)
-- [ ] Stage 4 — key-value store: `SET`, `GET`, `DEL`
+- [x] Stage 4 — key-value store: `SET`, `GET`, `DEL` (+ `EXISTS`, `DBSIZE`)
 - [ ] Stage 5 — key expiry: `EXPIRE`, `TTL` (min-heap timer + lazy deletion)
 - [ ] Stage 6 — tests + Valgrind leak check under load
 - [ ] Stage 7 — `redis-benchmark` results
@@ -23,7 +23,10 @@ no threads, no external libraries, just POSIX sockets and Linux `epoll`.
 src/main.cpp      epoll event loop, connections, buffering, backpressure
 src/resp.cpp      incremental RESP parser (partial reads, pipelining) + reply encoders
 src/commands.cpp  command table and handlers
-test/             raw-RESP integration tests + redis-cli smoke test
+src/store.cpp     the keyspace (hash table, string_view lookups)
+test/             raw-RESP integration tests (also run against real Redis
+                  as a differential check), redis-cli smoke test, maxclients
+                  and leak-at-exit checks
 ```
 
 ## Development
@@ -35,10 +38,25 @@ container. The source is bind-mounted, so edit on the host as usual.
 ./dev make            # optimized build -> ./lite-redis-server
 ./dev make debug      # AddressSanitizer build -> ./lite-redis-server-debug
 ./dev make run        # build + start the server on :6379
-./dev make test       # ASan build + integration tests + redis-cli smoke test
+./dev make test       # ASan build + all tests + differential run vs real Redis
 
 # in a second terminal (same container):
 ./dev redis-cli
 ./dev bash            # shell inside the container
 ./dev --stop          # tear the container down
 ```
+
+Server flags: `--port N` (default 6379), `--maxclients N` (default 10000,
+lowered automatically to fit the open-file limit), `--verbose` (log every
+connect/disconnect). `Ctrl-C` / `SIGTERM` shut down cleanly.
+
+## Supported commands
+
+`PING`, `ECHO`, `QUIT`, `GET`, `SET key value [NX|XX]`, `DEL`, `EXISTS`,
+`DBSIZE`, plus `COMMAND` / `CONFIG GET` stubs so `redis-cli` and
+`redis-benchmark` work unmodified. Inline commands (telnet/nc) support Redis's
+quoting rules.
+
+When benchmarking, select the implemented commands, e.g.
+`redis-benchmark -t set,get`: the default suite also runs `INCR`, `LPUSH` etc.,
+which aren't implemented and make it exit.

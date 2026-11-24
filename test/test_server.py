@@ -6,6 +6,11 @@ library, so we control exactly how bytes are split across packets).
     ./dev python3 test/test_server.py      # terminal 2
 
 Run a subset by name:  ./dev python3 test/test_server.py pipelin partial
+
+Differential mode: TARGET=redis runs the same tests against a REAL
+redis-server, which checks that our expected replies are what Redis itself
+returns. Tests marked @lite_only check behaviour that is specific to
+lite-redis (e.g. our COMMAND stub) and are skipped there.
 """
 import os
 import socket
@@ -15,6 +20,17 @@ import threading
 import time
 
 HOST, PORT = "127.0.0.1", int(os.environ.get("PORT", 6379))
+TARGET = os.environ.get("TARGET", "lite")
+# Unique per run, so tests never collide with keys from earlier runs (we
+# have no FLUSHALL, and a real redis-server may hold other data).
+K = f"t{os.getpid()}:"
+
+LITE_ONLY = set()
+
+
+def lite_only(fn):
+    LITE_ONLY.add(fn.__name__)
+    return fn
 
 
 # --------------------------------------------------------------------------
@@ -150,6 +166,7 @@ def test_unknown_command():
         check(c.cmd("PING"), "PONG")  # connection still usable
 
 
+@lite_only  # real Redis returns its full command docs here
 def test_command_docs_for_redis_cli():
     with Client() as c:
         check(c.cmd("COMMAND", "DOCS"), [])
@@ -240,12 +257,32 @@ def test_protocol_error_bad_bulk_prefix():
 
 
 def test_protocol_error_bad_lengths():
-    for bad in [b"*abc\r\n", b"*1\r\n$-5\r\n", b"*1\r\n$3\r\nabcXY",
-                b"*99999999\r\n", b"*1\r\n$999999999999\r\n"]:
+    for bad in [b"*abc\r\n", b"*1\r\n$-5\r\n", b"*1\r\n$999999999999\r\n"]:
         with Client() as c:
             c.send_raw(bad)
             check_err(c.read_reply(), "ERR Protocol error")
             assert c.is_closed(), f"not closed after {bad!r}"
+
+
+@lite_only
+def test_protocol_error_missing_crlf_after_bulk():
+    # Stricter than real Redis: Redis just skips the 2 bytes after a bulk
+    # payload without checking they are CRLF, so "abcXY" would run "abc".
+    # We treat it as a corrupt stream.
+    with Client() as c:
+        c.send_raw(b"*1\r\n$3\r\nabcXY")
+        check_err(c.read_reply(), "ERR Protocol error: expected CRLF")
+        assert c.is_closed()
+
+
+@lite_only
+def test_protocol_error_too_many_args():
+    # Stricter than real Redis 7, which accepts up to INT_MAX array elements
+    # and just waits for them. We cap a command at 1M arguments.
+    with Client() as c:
+        c.send_raw(b"*99999999\r\n")
+        check_err(c.read_reply(), "ERR Protocol error: invalid multibulk length")
+        assert c.is_closed()
 
 
 def test_huge_header_without_newline():
@@ -327,13 +364,381 @@ def test_abrupt_disconnects():
 
 
 # --------------------------------------------------------------------------
+# Key-value store: SET / GET / DEL / EXISTS / DBSIZE (Stage 4)
+# --------------------------------------------------------------------------
+
+def test_set_get_basic():
+    with Client() as c:
+        check(c.cmd("SET", K + "a", "1"), "OK")
+        check(c.cmd("GET", K + "a"), b"1")
+
+
+def test_get_missing_is_null():
+    with Client() as c:
+        check(c.cmd("GET", K + "never-set"), None)
+
+
+def test_set_overwrite():
+    with Client() as c:
+        c.cmd("SET", K + "ow", "first")
+        check(c.cmd("SET", K + "ow", "second"), "OK")
+        check(c.cmd("GET", K + "ow"), b"second")
+
+
+def test_overwrite_big_then_small():
+    # Exercises the shrink-on-overwrite path in Store::set.
+    with Client(timeout=30) as c:
+        check(c.cmd("SET", K + "shrink", b"B" * (4 * 1024 * 1024)), "OK")
+        check(c.cmd("SET", K + "shrink", "tiny"), "OK")
+        check(c.cmd("GET", K + "shrink"), b"tiny")
+        check(c.cmd("SET", K + "shrink", b"C" * 100000), "OK")
+        check(c.cmd("GET", K + "shrink"), b"C" * 100000)
+        c.cmd("DEL", K + "shrink")
+
+
+def test_binary_keys_and_values():
+    key = K.encode() + b"bin\r\n\x00key"
+    val = b"\x00\xff\r\n$3\r\nfoo\r\n" * 10
+    with Client() as c:
+        check(c.cmd("SET", key, val), "OK")
+        check(c.cmd("GET", key), val)
+        check(c.cmd("EXISTS", key), 1)
+        check(c.cmd("DEL", key), 1)
+
+
+def test_empty_value_vs_missing():
+    with Client() as c:
+        check(c.cmd("SET", K + "empty", ""), "OK")
+        check(c.cmd("GET", K + "empty"), b"")    # $0: exists, empty
+        check(c.cmd("GET", K + "nope"), None)   # $-1: missing
+        check(c.cmd("EXISTS", K + "empty"), 1)
+
+
+def test_empty_key():
+    # "" is a valid key in Redis (it can't carry our per-run prefix, so this
+    # test cleans up after itself).
+    with Client() as c:
+        check(c.cmd("SET", "", "empty-key-value"), "OK")
+        check(c.cmd("GET", ""), b"empty-key-value")
+        check(c.cmd("DEL", ""), 1)
+        check(c.cmd("GET", ""), None)
+
+
+def test_del():
+    with Client() as c:
+        c.cmd("SET", K + "d1", "x")
+        c.cmd("SET", K + "d2", "x")
+        check(c.cmd("DEL", K + "d1", K + "d2", K + "missing"), 2)
+        check(c.cmd("GET", K + "d1"), None)
+        check(c.cmd("DEL", K + "d1"), 0)
+
+
+def test_del_duplicate_key_counts_once():
+    with Client() as c:
+        c.cmd("SET", K + "dup", "x")
+        check(c.cmd("DEL", K + "dup", K + "dup"), 1)
+
+
+def test_exists_counts_duplicates():
+    with Client() as c:
+        c.cmd("SET", K + "ex", "x")
+        check(c.cmd("EXISTS", K + "ex", K + "ex", K + "missing"), 2)
+
+
+def test_set_nx_xx():
+    with Client() as c:
+        k = K + "nxxx"
+        check(c.cmd("SET", k, "v1", "XX"), None)   # missing + XX -> not set
+        check(c.cmd("GET", k), None)
+        check(c.cmd("SET", k, "v1", "NX"), "OK")   # missing + NX -> set
+        check(c.cmd("SET", k, "v2", "nx"), None)   # exists + NX -> not set
+        check(c.cmd("GET", k), b"v1")
+        check(c.cmd("SET", k, "v3", "xX"), "OK")   # exists + XX -> set
+        check(c.cmd("GET", k), b"v3")
+
+
+def test_set_syntax_errors():
+    with Client() as c:
+        check_err(c.cmd("SET", K + "s", "v", "NX", "XX"), "ERR syntax error")
+        check_err(c.cmd("SET", K + "s", "v", "BOGUS"), "ERR syntax error")
+        check(c.cmd("GET", K + "s"), None)  # failed SET must not write
+
+
+def test_arity_errors():
+    with Client() as c:
+        check_err(c.cmd("GET"), "ERR wrong number of arguments for 'get' command")
+        check_err(c.cmd("GET", "a", "b"), "ERR wrong number of arguments for 'get' command")
+        check_err(c.cmd("SET", "a"), "ERR wrong number of arguments for 'set' command")
+        check_err(c.cmd("DEL"), "ERR wrong number of arguments for 'del' command")
+        check_err(c.cmd("EXISTS"), "ERR wrong number of arguments for 'exists' command")
+
+
+def test_command_names_case_insensitive():
+    with Client() as c:
+        check(c.cmd("set", K + "case", "v"), "OK")
+        check(c.cmd("gEt", K + "case"), b"v")
+        check(c.cmd("Del", K + "case"), 1)
+
+
+def test_large_value_set_get():
+    val = os.urandom(16 * 1024 * 1024)
+    with Client(timeout=30) as c:
+        t = threading.Thread(target=c.send_raw, args=(encode("SET", K + "big", val),))
+        t.start()
+        check(c.read_reply(), "OK")
+        t.join()
+        assert c.cmd("GET", K + "big") == val, "16 MB value corrupted"
+        check(c.cmd("DEL", K + "big"), 1)
+
+
+def test_keys_visible_across_clients():
+    with Client() as a, Client() as b:
+        check(a.cmd("SET", K + "shared", "from-a"), "OK")
+        check(b.cmd("GET", K + "shared"), b"from-a")
+        check(b.cmd("DEL", K + "shared"), 1)
+        check(a.cmd("GET", K + "shared"), None)
+
+
+def test_data_outlives_connection():
+    with Client() as a:
+        a.cmd("SET", K + "persist", "still-here")
+    with Client() as b:
+        check(b.cmd("GET", K + "persist"), b"still-here")
+
+
+def test_many_keys_pipelined_and_dbsize():
+    n = 50000
+    keys = [f"{K}many:{i}" for i in range(n)]
+    with Client(timeout=30) as c:
+        before = c.cmd("DBSIZE")
+        c.send_raw(b"".join(encode("SET", k, f"v{i}") for i, k in enumerate(keys)))
+        for _ in range(n):
+            check(c.read_reply(), "OK")
+        check(c.cmd("DBSIZE"), before + n)
+        c.send_raw(b"".join(encode("GET", k) for k in keys))
+        for i in range(n):
+            check(c.read_reply(), f"v{i}".encode())
+        check(c.cmd("DEL", *keys), n)
+        check(c.cmd("DBSIZE"), before)
+
+
+def test_reply_order_preserved_in_pipeline():
+    # Mixed commands in one packet: replies must come back in request order.
+    with Client() as c:
+        k = K + "order"
+        c.send_raw(encode("SET", k, "1") + encode("GET", k) + encode("DEL", k)
+                   + encode("GET", k) + encode("EXISTS", k) + encode("PING"))
+        for want in ["OK", b"1", 1, None, 0, "PONG"]:
+            check(c.read_reply(), want)
+
+
+# --------------------------------------------------------------------------
+# Regressions from the Stage 4 multi-agent review. Expected replies were
+# checked against real Redis 7.0.15 (these run in the TARGET=redis pass too,
+# except @lite_only ones).
+# --------------------------------------------------------------------------
+
+def raw_exchange(data, nreplies):
+    with Client() as c:
+        c.send_raw(data)
+        return [c.read_reply() for _ in range(nreplies)]
+
+
+def test_inline_double_quotes_and_escapes():
+    k = K + "q"
+    check(raw_exchange(f'SET {k} "hello world"\r\nGET {k}\r\n'.encode(), 2), ["OK", b"hello world"])
+    check(raw_exchange(b'ECHO "a\\x41\\n\\t\\"q\\""\r\n', 1), [b'aA\n\t"q"'])
+    check(raw_exchange(b'ECHO ""\r\n', 1), [b""])
+
+
+def test_inline_single_quotes():
+    k = K + "sq"
+    check(raw_exchange(f"SET {k} 'a b'\r\nGET {k}\r\n".encode(), 2), ["OK", b"a b"])
+    check(raw_exchange(b"ECHO 'it\\'s'\r\n", 1), [b"it's"])
+
+
+def test_inline_quote_mid_token():
+    # sdssplitargs quirk: a quote can open in the middle of a token.
+    check(raw_exchange(b'ECHO ab"c d"\r\n', 1), [b"abc d"])
+
+
+def test_inline_unbalanced_quotes_is_protocol_error():
+    for bad in [b'ECHO "abc\r\n', b"ECHO 'abc\r\n", b'ECHO "a"b\r\n']:
+        with Client() as c:
+            c.send_raw(bad)
+            check_err(c.read_reply(), "ERR Protocol error: unbalanced quotes in request")
+            assert c.is_closed(), f"not closed after {bad!r}"
+
+
+def test_inline_carriage_returns_are_whitespace():
+    check(raw_exchange(b"PING\r\r\n", 1), ["PONG"])
+    check(raw_exchange(b"\r\r\nPING\r\n", 1), ["PONG"])
+    check_err(raw_exchange(b"ECHO a\rb\r\n", 1)[0],
+              "ERR wrong number of arguments for 'echo' command")
+
+
+def test_unknown_command_arg_budget():
+    with Client() as c:
+        got = c.cmd("FOO", *[str(i) for i in range(20)])
+        want = "ERR unknown command 'FOO', with args beginning with: " + \
+               "".join(f"'{i}' " for i in range(20))
+        check(str(got), want)
+        got = c.cmd("FOO", "a" * 100, "b" * 100, "c" * 100)
+        check(str(got), "ERR unknown command 'FOO', with args beginning with: '"
+              + "a" * 100 + "' '" + "b" * 25 + "' ")
+
+
+def test_quit_ignores_arguments():
+    with Client() as c:
+        c.send_raw(encode("QUIT", "x") + encode("PING"))
+        check(c.read_reply(), "OK")
+        assert c.is_closed(), "QUIT x must close and not run the pipelined PING"
+
+
+def test_command_unknown_subcommand():
+    with Client() as c:
+        check_err(c.cmd("COMMAND", "FOOBAR"),
+                  "ERR unknown subcommand 'FOOBAR'. Try COMMAND HELP.")
+
+
+@lite_only  # real Redis has ~240 commands
+def test_command_count_and_info_types():
+    with Client() as c:
+        n = c.cmd("COMMAND", "COUNT")
+        assert isinstance(n, int) and n >= 9, n
+        info = c.cmd("COMMAND", "INFO", "get", "nosuchcmd", "del")
+        assert len(info) == 3 and info[1] is None, info
+        check(info[0][:6], [b"get", 2, [], 1, 1, 1])
+        check(info[2][:6], [b"del", -2, [], 1, -1, 1])
+
+
+def test_config_get_for_redis_benchmark():
+    # run_tests.sh starts the real redis with --save "" --appendonly no, so
+    # both servers must answer identically.
+    with Client() as c:
+        check(c.cmd("CONFIG", "GET", "save"), [b"save", b""])
+        check(c.cmd("CONFIG", "GET", "appendonly"), [b"appendonly", b"no"])
+        check(c.cmd("CONFIG", "GET", "no-such-param"), [])
+        check_err(c.cmd("CONFIG", "GET"), "ERR wrong number of arguments for 'config|get' command")
+
+
+def test_protocol_error_messages_exact():
+    for data, msg in [
+        (b"*" + b"1" * 70000, "ERR Protocol error: too big mbulk count string"),
+        (b"*1\r\n$" + b"1" * 70000, "ERR Protocol error: too big bulk count string"),
+        (b"*01\r\n", "ERR Protocol error: invalid multibulk length"),
+        (b"*1\r\n$04\r\nPING\r\n", "ERR Protocol error: invalid bulk length"),
+        (b"*-0\r\n", "ERR Protocol error: invalid multibulk length"),
+    ]:
+        with Client() as c:
+            c.send_raw(data)
+            check(str(c.read_reply()), msg)
+            assert c.is_closed()
+
+
+def test_protocol_error_reply_never_contains_raw_crlf():
+    # The offending byte is echoed in the error; a raw \r there would end
+    # the error line early and forge a second reply.
+    with Client() as c:
+        c.send_raw(b"*1\r\n\r\nPING\r\n")
+        check(str(c.read_reply()), "ERR Protocol error: expected '$', got ' '")
+        assert c.is_closed()
+
+
+@lite_only  # real Redis waits for a '\r' before validating, so it just hangs
+def test_protocol_error_bare_lf_is_sanitized():
+    with Client() as c:
+        c.send_raw(b"*1\r\n\n")
+        check(str(c.read_reply()), "ERR Protocol error: expected '$', got ' '")
+        assert c.is_closed()
+
+
+def test_many_args_trickled_is_not_quadratic():
+    # 200k one-byte args arriving in ~1 KB pieces = ~1400 reads. A parser
+    # that restarts from byte 0 on every read does ~1400 x 200k arg parses
+    # (seconds of CPU, and every other client stalls meanwhile). Resumable
+    # parsing touches each byte once.
+    n = 200000
+    data = encode("EXISTS", *(["x"] * n))
+    with Client(timeout=30) as c, Client() as probe:
+        t0 = time.time()
+        worst_ping = 0.0
+        for i in range(0, len(data), 1024):
+            c.send_raw(data[i:i + 1024])
+            if i % (64 * 1024) == 0:
+                p0 = time.time()
+                check(probe.cmd("PING"), "PONG")
+                worst_ping = max(worst_ping, time.time() - p0)
+        check(c.read_reply(), 0)
+        elapsed = time.time() - t0
+    assert elapsed < 10, f"took {elapsed:.1f}s"
+    assert worst_ping < 0.25, f"other clients stalled: worst PING {worst_ping * 1000:.0f} ms"
+
+
+def rss_kb(pid):
+    with open(f"/proc/{pid}/status") as f:
+        for line in f:
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1])
+    raise RuntimeError("no VmRSS")
+
+
+@lite_only  # needs the server's pid (SERVER_PID, set by run_tests.sh)
+def test_output_backpressure_bounds_memory():
+    # ~3000 "GET bigkey" (1 MB value) fit in ~70 KB of request bytes, i.e.
+    # about one read(). Without pausing execution at MAX_WBUF the server
+    # would build ~3 GB of replies in one go. With it, it only ever holds
+    # about MAX_WBUF plus one reply while the client isn't reading.
+    pid = os.environ.get("SERVER_PID")
+    if not pid:
+        print("    (SERVER_PID not set; skipping memory assertion)")
+    key = K + "bp-big"
+    val = b"v" * (1024 * 1024)
+    n = 3000
+    with Client(timeout=60) as c:
+        check(c.cmd("SET", key, val), "OK")
+        before = rss_kb(pid) if pid else 0
+        c.send_raw(b"".join(encode("GET", key) for _ in range(n)))
+        time.sleep(1.0)  # let the server run as far as it will
+        if pid:
+            grown_mb = (rss_kb(pid) - before) / 1024
+            assert grown_mb < 200, f"server RSS grew {grown_mb:.0f} MB while client wasn't reading"
+        for _ in range(n):  # and every reply still arrives, in order
+            assert c.read_reply() == val
+        check(c.cmd("DEL", key), 1)
+
+
+@lite_only  # real Redis frees the client on EOF and DROPS queued replies
+def test_backpressure_then_half_close_delivers_everything():
+    # Pause (output over MAX_WBUF) + client EOF: the paused commands must
+    # still run and all replies arrive before the server closes.
+    key = K + "bp-eof"
+    with Client() as setup:
+        setup.cmd("SET", key, b"w" * 200000)
+    n = 200
+    with Client(timeout=30) as c:
+        c.send_raw(b"".join(encode("GET", key) for _ in range(n)) + encode("ECHO", "last"))
+        c.sock.shutdown(socket.SHUT_WR)
+        for _ in range(n):
+            assert c.read_reply() == b"w" * 200000
+        check(c.read_reply(), b"last")
+        assert c.is_closed()
+    with Client() as cleanup:
+        cleanup.cmd("DEL", key)
+
+
+# --------------------------------------------------------------------------
 
 if __name__ == "__main__":
     filters = sys.argv[1:]
     tests = [(k, v) for k, v in list(globals().items())
              if k.startswith("test_") and (not filters or any(f in k for f in filters))]
-    failed = 0
+    failed = skipped = 0
     for name, fn in tests:
+        if TARGET != "lite" and name in LITE_ONLY:
+            skipped += 1
+            print(f"SKIP {name} (lite-redis specific)")
+            continue
         t0 = time.time()
         try:
             fn()
@@ -341,5 +746,6 @@ if __name__ == "__main__":
         except Exception as e:
             failed += 1
             print(f"FAIL {name}: {e!r}")
-    print(f"\n{len(tests) - failed}/{len(tests)} passed")
+    ran = len(tests) - skipped
+    print(f"\n[{TARGET}] {ran - failed}/{ran} passed" + (f", {skipped} skipped" if skipped else ""))
     sys.exit(1 if failed else 0)

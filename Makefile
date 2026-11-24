@@ -1,5 +1,5 @@
 CXX := clang++
-CXXFLAGS := -std=c++17 -Wall -Wextra -Iinclude
+CXXFLAGS := -std=c++20 -Wall -Wextra -Iinclude
 LDFLAGS :=
 
 SRC := $(wildcard src/*.cpp)
@@ -30,7 +30,8 @@ debug:
 
 # -MMD -MP: also emit build/foo.d listing the headers foo.cpp includes, so
 # editing a header rebuilds every .o that depends on it (included below).
-$(OBJ_DIR)/%.o: src/%.cpp | $(OBJ_DIR)
+# Depending on Makefile too means changing flags (e.g. -std) rebuilds everything.
+$(OBJ_DIR)/%.o: src/%.cpp Makefile | $(OBJ_DIR)
 	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
 
 -include $(OBJ:.o=.d)
