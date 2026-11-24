@@ -1070,6 +1070,43 @@ def test_mass_expiry_does_not_stall_clients():
 
 
 # --------------------------------------------------------------------------
+# Regressions from the Stage 5 review
+# --------------------------------------------------------------------------
+
+def test_option_keywords_compare_like_c_strings():
+    # Redis matches options as C strings, which stop at NUL: "NX\0junk" is NX.
+    k = K + "nulopt"
+    with Client() as c:
+        check(c.cmd("SET", k, "a", b"NX\x00junk"), "OK")
+        check(c.cmd("SET", k, "b", b"GET\x00x"), b"a")
+        check(c.cmd("SET", k, "c", b"EX\x00", "100"), "OK")
+        check(c.cmd("TTL", k), 100)
+        check(c.cmd("PERSIST", k), 1)
+        check(c.cmd("EXPIRE", k, "300", b"NX\x00"), 1)
+        check_err(c.cmd("EXPIRE", k, "300", b"F\x00OO"), "ERR Unsupported option F")
+        assert str(c.cmd("EXPIRE", k, "300", b"F\x00OO")) == "ERR Unsupported option F"
+        c.cmd("DEL", k)
+
+
+def test_huge_ttl_overflow_matches_redis():
+    # Redis adds the TTL to Unix-epoch ms, so these overflow there even though
+    # they'd fit on top of our (smaller) monotonic clock. Errors must match.
+    k = K + "huge"
+    with Client() as c:
+        c.cmd("SET", k, "v")
+        check_err(c.cmd("SET", k, "v", "PX", "9223372036000000000"),
+                  "ERR invalid expire time in 'set' command")
+        check_err(c.cmd("SET", k, "v", "EX", "9223372036000000"),
+                  "ERR invalid expire time in 'set' command")
+        check_err(c.cmd("PEXPIRE", k, "9223372036000000000"),
+                  "ERR invalid expire time in 'pexpire' command")
+        check_err(c.cmd("EXPIRE", k, "9223372036000000"),
+                  "ERR invalid expire time in 'expire' command")
+        check(c.cmd("TTL", k), -1)
+        c.cmd("DEL", k)
+
+
+# --------------------------------------------------------------------------
 
 if __name__ == "__main__":
     filters = sys.argv[1:]

@@ -41,6 +41,22 @@ void Store::erase(Node* n) {
     // of the heap BEFORE the hash table frees the node.
     if (n->second.heap_idx != SIZE_MAX) heap_remove(n);
     map_.erase(map_.find(n->first));
+    maybe_shrink();
+}
+
+// Neither std::vector nor std::unordered_map ever shrinks by itself: after 1M
+// keys expire, the heap array (16 MB) and the hash table's bucket array
+// (8 MB) would stay allocated with an empty keyspace. Shrink once they're
+// mostly empty. The gap between the grow point (full) and the shrink points
+// (1/4 for the heap, 1/10 for the table, like Redis's dict) is hysteresis:
+// a keyspace hovering around one size can't make us grow/shrink repeatedly.
+// Both are O(n) but happen at most once per ~4-10x change in size.
+void Store::maybe_shrink() {
+    constexpr size_t MIN_SHRINK = 64 * 1024;
+    if (heap_.capacity() > MIN_SHRINK && heap_.size() < heap_.capacity() / 4)
+        heap_.shrink_to_fit();
+    if (map_.bucket_count() > MIN_SHRINK && map_.size() < map_.bucket_count() / 10)
+        map_.rehash(0); // = smallest bucket count that fits size(); nodes don't move
 }
 
 void Store::set_expire(Node* n, int64_t at_ms) {
@@ -48,6 +64,7 @@ void Store::set_expire(Node* n, int64_t at_ms) {
     if (n->second.heap_idx == SIZE_MAX) {
         heap_insert(n);
     } else {
+        heap_[n->second.heap_idx].at = at_ms; // keep the heap's copy in sync
         // Deadline changed: it may need to move toward the root (sooner) or
         // toward the leaves (later). Only one of these actually moves it.
         sift_up(n->second.heap_idx);
@@ -63,9 +80,9 @@ bool Store::clear_expire(Node* n) {
 }
 
 bool Store::expire_due(size_t budget) {
-    while (!heap_.empty() && heap_[0]->second.expire_at <= now_) {
+    while (!heap_.empty() && heap_[0].at <= now_) {
         if (budget-- == 0) return true; // more due; let clients run first
-        erase(heap_[0]);
+        erase(heap_[0].node);
         expired_total_++;
     }
     return false;
@@ -77,35 +94,33 @@ bool Store::expire_due(size_t budget) {
 // ---------------------------------------------------------------------------
 
 void Store::sift_up(size_t i) {
-    Node* n = heap_[i];
-    int64_t t = n->second.expire_at;
+    HeapItem item = heap_[i];
     while (i > 0) {
         size_t parent = (i - 1) / 2;
-        if (heap_[parent]->second.expire_at <= t) break;
+        if (heap_[parent].at <= item.at) break;
         heap_place(i, heap_[parent]); // move the parent down one level
         i = parent;
     }
-    heap_place(i, n);
+    heap_place(i, item);
 }
 
 void Store::sift_down(size_t i) {
-    Node* n = heap_[i];
-    int64_t t = n->second.expire_at;
+    HeapItem item = heap_[i];
     size_t size = heap_.size();
     while (true) {
         size_t child = 2 * i + 1;
         if (child >= size) break;
-        if (child + 1 < size && heap_[child + 1]->second.expire_at < heap_[child]->second.expire_at)
+        if (child + 1 < size && heap_[child + 1].at < heap_[child].at)
             child++; // the smaller of the two children
-        if (heap_[child]->second.expire_at >= t) break;
+        if (heap_[child].at >= item.at) break;
         heap_place(i, heap_[child]); // move the child up one level
         i = child;
     }
-    heap_place(i, n);
+    heap_place(i, item);
 }
 
 void Store::heap_insert(Node* n) {
-    heap_.push_back(n);
+    heap_.push_back({n->second.expire_at, n});
     n->second.heap_idx = heap_.size() - 1;
     sift_up(heap_.size() - 1);
 }
@@ -115,27 +130,28 @@ void Store::heap_remove(Node* n) {
     // the vector, then restore order around the hole. The moved node may
     // belong above or below that position, so try both directions.
     size_t i = n->second.heap_idx;
-    Node* last = heap_.back();
+    HeapItem last = heap_.back();
     heap_.pop_back();
     n->second.heap_idx = SIZE_MAX;
-    if (last == n) return; // it WAS the last node
+    if (last.node == n) return; // it WAS the last node
     heap_place(i, last);
     sift_up(i);
-    sift_down(last->second.heap_idx);
+    sift_down(last.node->second.heap_idx);
 }
 
 bool Store::check_invariants() const {
     for (size_t i = 0; i < heap_.size(); i++) {
-        const Node* n = heap_[i];
+        const Node* n = heap_[i].node;
         if (n->second.heap_idx != i || n->second.expire_at == NO_EXPIRY) return false;
-        if (i > 0 && heap_[(i - 1) / 2]->second.expire_at > n->second.expire_at) return false;
+        if (heap_[i].at != n->second.expire_at) return false; // cached copy in sync
+        if (i > 0 && heap_[(i - 1) / 2].at > heap_[i].at) return false;
     }
     size_t with_ttl = 0;
     for (const auto& kv : map_) {
         bool in_heap = kv.second.heap_idx != SIZE_MAX;
         if (in_heap != (kv.second.expire_at != NO_EXPIRY)) return false;
         if (in_heap) {
-            if (kv.second.heap_idx >= heap_.size() || heap_[kv.second.heap_idx] != &kv) return false;
+            if (kv.second.heap_idx >= heap_.size() || heap_[kv.second.heap_idx].node != &kv) return false;
             with_ttl++;
         }
     }

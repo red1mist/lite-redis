@@ -1,7 +1,9 @@
 #include "commands.h"
 
+#include <algorithm>
 #include <cctype>
 #include <climits>
+#include <ctime>
 #include <unordered_map>
 
 #include "resp.h"
@@ -23,8 +25,14 @@ struct CommandSpec {
 
 const std::unordered_map<std::string, CommandSpec>& command_table();
 
+// Redis compares option keywords and formats error text as C strings, which
+// stop at the first NUL byte ("NX\0junk" counts as NX). Mirror that.
+std::string_view until_nul(std::string_view s) { return s.substr(0, s.find('\0')); }
+
 // ASCII case-insensitive compare, for keywords like NX / xx / GET.
+// Compares up to the first NUL, like Redis's strcasecmp.
 bool iequals(std::string_view a, std::string_view b) {
+    a = until_nul(a);
     if (a.size() != b.size()) return false;
     for (size_t i = 0; i < a.size(); i++)
         if (std::tolower(static_cast<unsigned char>(a[i])) !=
@@ -148,6 +156,17 @@ void cmd_config(const Args& args, CommandContext& ctx) {
 
 const char* const NOT_AN_INTEGER = "ERR value is not an integer or out of range";
 
+// Overflow guard for "now + ttl". Our deadlines are on the monotonic clock
+// (uptime-sized numbers), but Redis adds the TTL to Unix-epoch ms, so it
+// rejects TTLs above LLONG_MAX - <epoch ms>. Check against whichever base is
+// larger so the accepted range (and the error) matches Redis exactly.
+bool deadline_overflows(long long ttl_ms, int64_t now) {
+    timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    int64_t wall = static_cast<int64_t>(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
+    return ttl_ms > LLONG_MAX - std::max(now, wall);
+}
+
 void invalid_expire_time(CommandContext& ctx, const char* cmd) {
     resp::add_error(ctx.out, std::string("ERR invalid expire time in '") + cmd + "' command");
 }
@@ -204,7 +223,7 @@ void cmd_set(const Args& args, CommandContext& ctx) {
             return;
         }
         if (unit == EX) ttl *= 1000;
-        if (ttl > LLONG_MAX - ctx.store.now()) {
+        if (deadline_overflows(ttl, ctx.store.now())) {
             invalid_expire_time(ctx, "set");
             return;
         }
@@ -220,7 +239,9 @@ void cmd_set(const Args& args, CommandContext& ctx) {
         if (!get) resp::add_null(ctx.out); // with GET, the old value was the reply
         return;
     }
-    Store::Node* n = ctx.store.upsert(args[1], args[2], keepttl);
+    // With EX/PX, keep the old heap node (keep_ttl) and just move it to the
+    // new deadline: one O(log n) re-sift instead of remove + re-insert.
+    Store::Node* n = ctx.store.upsert(args[1], args[2], keepttl || deadline != NO_EXPIRY);
     if (deadline != NO_EXPIRY) ctx.store.set_expire(n, deadline);
     if (!get) resp::add_simple(ctx.out, "OK");
 }
@@ -265,7 +286,7 @@ void expire_generic(const Args& args, CommandContext& ctx, long long unit_ms, co
         else if (iequals(args[i], "lt")) lt = true;
         else {
             std::string msg = "ERR Unsupported option ";
-            msg.append(args[i]);
+            msg.append(until_nul(args[i]));
             resp::add_error(ctx.out, msg);
             return;
         }
@@ -293,7 +314,7 @@ void expire_generic(const Args& args, CommandContext& ctx, long long unit_ms, co
         }
         when *= 1000;
     }
-    if (when > LLONG_MAX - ctx.store.now()) {
+    if (deadline_overflows(when, ctx.store.now())) {
         invalid_expire_time(ctx, cmd);
         return;
     }
@@ -374,9 +395,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
 // arg is cut to whatever room is left), so the message stays short no matter
 // how many or how long the args are. CR/LF are neutralized by add_error.
 // Redis formats these with printf's %s, which stops at a NUL byte, so each
-// name/arg is cut at its first NUL before the length limits apply.
-std::string_view until_nul(std::string_view s) { return s.substr(0, s.find('\0')); }
-
+// name/arg is cut at its first NUL (until_nul) before the length limits apply.
 void unknown_command(const Args& args, CommandContext& ctx) {
     std::string arglist;
     for (size_t i = 1; i < args.size() && arglist.size() < 128; i++) {

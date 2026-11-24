@@ -93,13 +93,15 @@ public:
     // passed; returns true if more are still due (the caller should come back
     // soon rather than sleep). The budget keeps one iteration short even if
     // a million keys expire in the same millisecond.
-    int64_t next_expiry() const { return heap_.empty() ? NO_EXPIRY : heap_[0]->second.expire_at; }
+    int64_t next_expiry() const { return heap_.empty() ? NO_EXPIRY : heap_[0].at; }
     bool expire_due(size_t budget);
 
     // Number of keys, including expired ones not yet removed (same as Redis's
     // DBSIZE; active expiry keeps that window small).
     size_t size() const { return map_.size(); }
     size_t keys_with_ttl() const { return heap_.size(); }
+    size_t heap_capacity() const { return heap_.capacity(); }   // for tests
+    size_t bucket_count() const { return map_.bucket_count(); } // for tests
     uint64_t expired_total() const { return expired_total_; }
 
     // Debug/test helper: verifies the heap property and every heap_idx.
@@ -110,12 +112,25 @@ private:
         return n.second.expire_at != NO_EXPIRY && n.second.expire_at <= now_;
     }
 
+    // Heap slot: the deadline is copied INTO the heap array next to the
+    // pointer. Sifting compares deadlines dozens of times per operation; if
+    // it had to follow each Node* into its separately allocated hash-table
+    // node, nearly every comparison would be a cache miss (measured: ~2x
+    // slower active expiry with 1M keys). This way comparisons scan one
+    // contiguous array, and the node is touched only to update heap_idx.
+    struct HeapItem {
+        int64_t at;
+        Node* node;
+    };
+
     // Min-heap primitives over heap_. Every move goes through heap_place(),
     // which also records the new index in the entry.
-    void heap_place(size_t i, Node* n) {
-        heap_[i] = n;
-        n->second.heap_idx = i;
+    void heap_place(size_t i, HeapItem item) {
+        heap_[i] = item;
+        item.node->second.heap_idx = i;
     }
+    // Give memory back after a mass expiry/deletion (see store.cpp).
+    void maybe_shrink();
     void sift_up(size_t i);
     void sift_down(size_t i);
     void heap_insert(Node* n);
@@ -124,7 +139,7 @@ private:
     // std::equal_to<> (no template argument) is the transparent comparator
     // that pairs with StringHash for string_view lookups.
     std::unordered_map<std::string, Entry, StringHash, std::equal_to<>> map_;
-    std::vector<Node*> heap_;
+    std::vector<HeapItem> heap_;
     int64_t now_ = 0;
     uint64_t expired_total_ = 0;
 };

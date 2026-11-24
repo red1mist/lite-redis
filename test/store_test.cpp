@@ -212,6 +212,23 @@ void test_heap_order_many_updates() {
     }
 }
 
+void test_memory_given_back_after_mass_expiry() {
+    // A mass expiry must not leave the heap array and the hash table's bucket
+    // array at their peak size forever.
+    Store s;
+    s.set_now(0);
+    for (int i = 0; i < 300000; i++) s.set_expire(s.upsert("g" + std::to_string(i), "v"), 10);
+    size_t peak_heap = s.heap_capacity(), peak_buckets = s.bucket_count();
+    s.set_now(10);
+    while (s.expire_due(1000)) {}
+    CHECK(s.size() == 0, "all expired");
+    CHECK(s.heap_capacity() < peak_heap / 4, "heap capacity %zu (peak %zu)", s.heap_capacity(), peak_heap);
+    CHECK(s.bucket_count() < peak_buckets / 4, "buckets %zu (peak %zu)", s.bucket_count(), peak_buckets);
+    // ...and still fully usable afterwards.
+    for (int i = 0; i < 1000; i++) s.set_expire(s.upsert("h" + std::to_string(i), "v"), 20 + i % 7);
+    CHECK(s.check_invariants(), "invariants after shrink + reuse");
+}
+
 } // namespace
 
 int main() {
@@ -220,6 +237,7 @@ int main() {
     test_randomized_against_model(99, 50000, 2000);
     test_mass_expiry_is_bounded();
     test_heap_order_many_updates();
+    test_memory_given_back_after_mass_expiry();
     if (failures) {
         std::printf("store_test: %d failure(s)\n", failures);
         return 1;
