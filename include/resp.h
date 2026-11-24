@@ -91,6 +91,11 @@ ParseStatus parse_command(std::string_view buf, ParseState& st,
                           std::vector<std::string_view>& args, size_t& consumed,
                           std::string& err);
 
+// Strict decimal integer with Redis's string2ll rules: optional '-', digits,
+// no '+', no spaces, no leading zeros ("01", "-0"), no overflow. Used for
+// both protocol lengths and command arguments (EXPIRE seconds, SET EX ...).
+bool parse_integer(std::string_view s, long long& out);
+
 // Reply encoders: append one RESP value to `out`.
 void add_simple(std::string& out, std::string_view s);  // must not contain \r\n
 void add_error(std::string& out, std::string_view msg); // CR, LF, NUL -> spaces

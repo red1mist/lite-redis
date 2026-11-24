@@ -847,6 +847,229 @@ def test_protocol_error_never_contains_nul():
 
 
 # --------------------------------------------------------------------------
+# Key expiry: EXPIRE / PEXPIRE / TTL / PTTL / PERSIST / SET EX|PX (Stage 5)
+# --------------------------------------------------------------------------
+
+def test_expire_and_ttl_basics():
+    k = K + "e1"
+    with Client() as c:
+        check(c.cmd("TTL", k), -2)            # missing
+        check(c.cmd("EXPIRE", k, "100"), 0)   # can't expire a missing key
+        c.cmd("SET", k, "v")
+        check(c.cmd("TTL", k), -1)            # exists, no TTL
+        check(c.cmd("EXPIRE", k, "100"), 1)
+        check(c.cmd("TTL", k), 100)
+        pttl = c.cmd("PTTL", k)
+        assert 99000 < pttl <= 100000, pttl
+        check(c.cmd("PEXPIRE", k, "1600"), 1)
+        check(c.cmd("TTL", k), 2)             # 1.6 s rounds to 2, like Redis
+        c.cmd("DEL", k)
+
+
+def test_key_expires_lazily_and_is_invisible():
+    k = K + "e2"
+    with Client() as c:
+        check(c.cmd("SET", k, "v", "PX", "100"), "OK")
+        check(c.cmd("GET", k), b"v")
+        time.sleep(0.15)
+        check(c.cmd("GET", k), None)
+        check(c.cmd("EXISTS", k), 0)
+        check(c.cmd("TTL", k), -2)
+        check(c.cmd("DEL", k), 0)             # already expired: nothing to delete
+        check(c.cmd("EXPIRE", k, "10"), 0)
+        check(c.cmd("PERSIST", k), 0)
+
+
+def test_active_expiry_removes_untouched_keys():
+    # Nobody reads these keys again; only ACTIVE expiry can reclaim them.
+    # DBSIZE doesn't trigger lazy deletion, so it shows what's really stored.
+    n = 500
+    with Client() as c:
+        before = c.cmd("DBSIZE")
+        c.send_raw(b"".join(encode("SET", f"{K}act:{i}", "v", "PX", "50") for i in range(n)))
+        for _ in range(n):
+            check(c.read_reply(), "OK")
+        check(c.cmd("DBSIZE"), before + n)
+        deadline = time.time() + 2.0
+        while c.cmd("DBSIZE") != before and time.time() < deadline:
+            time.sleep(0.05)
+        check(c.cmd("DBSIZE"), before)
+
+
+@lite_only  # real Redis expires actively on a ~100 ms sampling cycle
+def test_active_expiry_is_timely():
+    # The heap tells the event loop exactly when the next key is due, so an
+    # untouched key disappears within a few ms of its deadline.
+    k = K + "timely"
+    with Client() as c:
+        before = c.cmd("DBSIZE")
+        t0 = time.time()
+        c.cmd("SET", k, "v", "PX", "100")
+        while c.cmd("DBSIZE") != before:
+            time.sleep(0.002)
+            assert time.time() - t0 < 1.0, "never expired"
+        took = (time.time() - t0) * 1000
+    assert 95 <= took < 140, f"expired after {took:.0f} ms (deadline 100 ms)"
+
+
+def test_set_overwrite_clears_ttl_unless_keepttl():
+    k = K + "e3"
+    with Client() as c:
+        c.cmd("SET", k, "a", "EX", "100")
+        c.cmd("SET", k, "b")
+        check(c.cmd("TTL", k), -1)
+        c.cmd("EXPIRE", k, "100")
+        check(c.cmd("SET", k, "c", "KEEPTTL"), "OK")
+        check(c.cmd("TTL", k), 100)
+        check(c.cmd("GET", k), b"c")
+        c.cmd("DEL", k)
+
+
+def test_set_expiry_options():
+    k = K + "e4"
+    with Client() as c:
+        check(c.cmd("SET", k, "v", "EX", "10"), "OK")
+        check(c.cmd("TTL", k), 10)
+        check(c.cmd("SET", k, "v", "px", "1500"), "OK")
+        assert 1400 < c.cmd("PTTL", k) <= 1500
+        check(c.cmd("SET", k, "v", "EX", "10", "EX", "20"), "OK")  # last wins
+        check(c.cmd("TTL", k), 20)
+        check(c.cmd("SET", k, "v", "NX", "EX", "5"), None)           # exists: no-op
+        check(c.cmd("TTL", k), 20)
+        c.cmd("DEL", k)
+
+
+def test_set_expiry_errors():
+    k = K + "e5"
+    with Client() as c:
+        for args, err in [
+            (["EX", "0"], "ERR invalid expire time in 'set' command"),
+            (["PX", "-5"], "ERR invalid expire time in 'set' command"),
+            (["EX", "9223372036854775807"], "ERR invalid expire time in 'set' command"),
+            (["EX", "abc"], "ERR value is not an integer or out of range"),
+            (["EX", "01"], "ERR value is not an integer or out of range"),
+            (["EX"], "ERR syntax error"),
+            (["EX", "10", "PX", "100"], "ERR syntax error"),
+            (["KEEPTTL", "EX", "10"], "ERR syntax error"),
+            (["EX", "10", "KEEPTTL"], "ERR syntax error"),
+        ]:
+            check_err(c.cmd("SET", k, "v", *args), err)
+        check(c.cmd("EXISTS", k), 0)  # failed SETs never write
+
+
+def test_set_get_option():
+    k = K + "e6"
+    with Client() as c:
+        check(c.cmd("SET", k, "one", "GET"), None)        # no old value
+        check(c.cmd("SET", k, "two", "GET"), b"one")
+        check(c.cmd("GET", k), b"two")
+        check(c.cmd("SET", k, "three", "NX", "GET"), b"two")  # NX fails, still returns old
+        check(c.cmd("GET", k), b"two")
+        check(c.cmd("SET", K + "e6-missing", "x", "XX", "GET"), None)
+        check(c.cmd("EXISTS", K + "e6-missing"), 0)
+        c.cmd("DEL", k)
+
+
+def test_expire_non_positive_deletes_key():
+    with Client() as c:
+        for cmd, ttl in [("EXPIRE", "-1"), ("EXPIRE", "0"), ("PEXPIRE", "-100"), ("PEXPIRE", "0")]:
+            k = f"{K}neg:{cmd}:{ttl}"
+            c.cmd("SET", k, "v")
+            check(c.cmd(cmd, k, ttl), 1)
+            check(c.cmd("EXISTS", k), 0)
+
+
+def test_expire_nx_xx_gt_lt():
+    k = K + "e7"
+    with Client() as c:
+        c.cmd("SET", k, "v")
+        check(c.cmd("EXPIRE", k, "100", "XX"), 0)   # no TTL yet
+        check(c.cmd("EXPIRE", k, "100", "GT"), 0)   # no TTL = infinite: never greater
+        check(c.cmd("EXPIRE", k, "100", "NX"), 1)
+        check(c.cmd("EXPIRE", k, "200", "NX"), 0)   # already has one
+        check(c.cmd("EXPIRE", k, "50", "GT"), 0)
+        check(c.cmd("EXPIRE", k, "300", "gt"), 1)
+        check(c.cmd("TTL", k), 300)
+        check(c.cmd("EXPIRE", k, "400", "LT"), 0)
+        check(c.cmd("EXPIRE", k, "30", "LT"), 1)
+        check(c.cmd("EXPIRE", k, "60", "XX"), 1)
+        check(c.cmd("TTL", k), 60)
+        c.cmd("PERSIST", k)
+        check(c.cmd("EXPIRE", k, "10", "LT"), 1)    # infinite -> anything is less
+        check(c.cmd("TTL", k), 10)
+        c.cmd("DEL", k)
+
+
+def test_expire_errors():
+    k = K + "e8"
+    with Client() as c:
+        c.cmd("SET", k, "v")
+        for args, err in [
+            (["10", "NX", "XX"], "ERR NX and XX, GT or LT options at the same time are not compatible"),
+            (["10", "NX", "GT"], "ERR NX and XX, GT or LT options at the same time are not compatible"),
+            (["10", "GT", "LT"], "ERR GT and LT options at the same time are not compatible"),
+            (["10", "FOO"], "ERR Unsupported option FOO"),
+            (["abc", "FOO"], "ERR Unsupported option FOO"),  # options are checked first
+            (["abc"], "ERR value is not an integer or out of range"),
+            (["1.5"], "ERR value is not an integer or out of range"),
+            (["9223372036854775807"], "ERR invalid expire time in 'expire' command"),
+        ]:
+            check_err(c.cmd("EXPIRE", k, *args), err)
+        check_err(c.cmd("PEXPIRE", k, "9223372036854775807"),
+                  "ERR invalid expire time in 'pexpire' command")
+        check_err(c.cmd("TTL"), "ERR wrong number of arguments for 'ttl' command")
+        check_err(c.cmd("EXPIRE", k), "ERR wrong number of arguments for 'expire' command")
+        check(c.cmd("TTL", k), -1)   # nothing above changed the key
+        c.cmd("DEL", k)
+
+
+def test_persist():
+    k = K + "e9"
+    with Client() as c:
+        check(c.cmd("PERSIST", k), 0)        # missing
+        c.cmd("SET", k, "v")
+        check(c.cmd("PERSIST", k), 0)        # no TTL
+        c.cmd("EXPIRE", k, "100")
+        check(c.cmd("PERSIST", k), 1)
+        check(c.cmd("TTL", k), -1)
+        c.cmd("DEL", k)
+
+
+def test_expired_key_is_replaced_fresh():
+    # SET ... KEEPTTL on a key that has already expired: the old key (and its
+    # TTL) is gone, so the new one has no TTL.
+    k = K + "e10"
+    with Client() as c:
+        c.cmd("SET", k, "old", "PX", "50")
+        time.sleep(0.1)
+        check(c.cmd("SET", k, "new", "KEEPTTL"), "OK")
+        check(c.cmd("TTL", k), -1)
+        check(c.cmd("GET", k), b"new")
+        c.cmd("DEL", k)
+
+
+@lite_only  # measures our event loop's behaviour during a mass expiry
+def test_mass_expiry_does_not_stall_clients():
+    # 200k keys all expiring in the same millisecond: the loop deletes them in
+    # bounded batches, so other clients keep getting answers meanwhile.
+    n = 200000
+    with Client(timeout=60) as c, Client() as probe:
+        before = c.cmd("DBSIZE")
+        c.send_raw(b"".join(encode("SET", f"{K}mass:{i}", "v", "PX", "300") for i in range(n)))
+        for _ in range(n):
+            c.read_reply()
+        worst = 0.0
+        t_end = time.time() + 1.5
+        while time.time() < t_end:
+            t0 = time.time()
+            check(probe.cmd("PING"), "PONG")
+            worst = max(worst, time.time() - t0)
+            time.sleep(0.005)
+        check(c.cmd("DBSIZE"), before)
+    assert worst < 0.1, f"a PING took {worst * 1000:.0f} ms during the mass expiry"
+
+
+# --------------------------------------------------------------------------
 
 if __name__ == "__main__":
     filters = sys.argv[1:]

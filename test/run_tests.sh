@@ -35,6 +35,9 @@ expect_eq() { # name, expected, actual
 }
 expect_eq "redis-cli PING" "PONG" "$(redis-cli -p "$PORT" PING)"
 expect_eq "redis-cli ECHO" "hi there" "$(redis-cli -p "$PORT" ECHO 'hi there')"
+redis-cli -p "$PORT" SET smoke:ttl v EX 100 >/dev/null
+expect_eq "redis-cli TTL" "100" "$(redis-cli -p "$PORT" TTL smoke:ttl)"
+redis-cli -p "$PORT" DEL smoke:ttl >/dev/null
 # Interactive mode sends COMMAND DOCS on startup. TERM=dumb stops its line
 # editor from querying the (fake) terminal for the cursor position.
 interactive=$( (sleep 0.3; printf 'PING\r'; sleep 0.3; printf 'quit\r'; sleep 0.3) |

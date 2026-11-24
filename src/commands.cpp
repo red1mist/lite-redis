@@ -1,6 +1,7 @@
 #include "commands.h"
 
 #include <cctype>
+#include <climits>
 #include <unordered_map>
 
 #include "resp.h"
@@ -145,48 +146,91 @@ void cmd_config(const Args& args, CommandContext& ctx) {
 // Keyspace commands
 // ---------------------------------------------------------------------------
 
+const char* const NOT_AN_INTEGER = "ERR value is not an integer or out of range";
+
+void invalid_expire_time(CommandContext& ctx, const char* cmd) {
+    resp::add_error(ctx.out, std::string("ERR invalid expire time in '") + cmd + "' command");
+}
+
 // GET key  ->  bulk string, or null ($-1) if the key doesn't exist.
 void cmd_get(const Args& args, CommandContext& ctx) {
-    const std::string* v = ctx.store.get(args[1]);
-    if (v) resp::add_bulk(ctx.out, *v);
+    Store::Node* n = ctx.store.find(args[1]); // lazily deletes it if expired
+    if (n) resp::add_bulk(ctx.out, n->second.value);
     else resp::add_null(ctx.out);
 }
 
-// SET key value [NX | XX]
-//   NX: only set if the key does NOT exist.  XX: only if it DOES exist.
-//   Reply: +OK, or null if NX/XX prevented the write.
-// (EX / PX expiry options arrive with Stage 5.)
+// SET key value [NX | XX] [GET] [EX seconds | PX milliseconds | KEEPTTL]
+//   NX / XX:  only set if the key does NOT / DOES exist (else reply null).
+//   GET:      reply with the OLD value (or null) instead of OK.
+//   EX / PX:  give the key a TTL.   KEEPTTL: keep its existing TTL.
+//   Without KEEPTTL, overwriting a key REMOVES its TTL (Redis semantics).
+// Parsing order and error precedence follow Redis 7: option syntax first,
+// then the expire value, then GET, then the NX/XX check.
+// (Not supported: EXAT / PXAT absolute deadlines -> syntax error.)
 void cmd_set(const Args& args, CommandContext& ctx) {
-    bool nx = false, xx = false;
+    bool nx = false, xx = false, get = false, keepttl = false;
+    enum { NONE, EX, PX } unit = NONE;
+    std::string_view expire_arg;
     for (size_t i = 3; i < args.size(); i++) {
-        if (iequals(args[i], "nx")) nx = true;
-        else if (iequals(args[i], "xx")) xx = true;
-        else {
+        std::string_view opt = args[i];
+        bool has_next = i + 1 < args.size();
+        if (iequals(opt, "nx") && !xx) nx = true;
+        else if (iequals(opt, "xx") && !nx) xx = true;
+        else if (iequals(opt, "get")) get = true;
+        else if (iequals(opt, "keepttl") && unit == NONE) keepttl = true;
+        else if (iequals(opt, "ex") && !keepttl && unit != PX && has_next) {
+            unit = EX;
+            expire_arg = args[++i];
+        } else if (iequals(opt, "px") && !keepttl && unit != EX && has_next) {
+            unit = PX;
+            expire_arg = args[++i];
+        } else {
             resp::add_error(ctx.out, "ERR syntax error");
             return;
         }
     }
-    if (nx && xx) { // contradictory; real Redis rejects this too
-        resp::add_error(ctx.out, "ERR syntax error");
-        return;
-    }
-    if (nx || xx) {
-        bool exists = ctx.store.exists(args[1]);
-        if ((nx && exists) || (xx && !exists)) {
-            resp::add_null(ctx.out);
+
+    int64_t deadline = NO_EXPIRY;
+    if (unit != NONE) {
+        long long ttl;
+        if (!resp::parse_integer(expire_arg, ttl)) {
+            resp::add_error(ctx.out, NOT_AN_INTEGER);
             return;
         }
+        // Unlike EXPIRE, SET rejects non-positive TTLs. Overflow-check the
+        // unit conversion and the addition of "now", as Redis does.
+        if (ttl <= 0 || (unit == EX && ttl > LLONG_MAX / 1000)) {
+            invalid_expire_time(ctx, "set");
+            return;
+        }
+        if (unit == EX) ttl *= 1000;
+        if (ttl > LLONG_MAX - ctx.store.now()) {
+            invalid_expire_time(ctx, "set");
+            return;
+        }
+        deadline = ctx.store.now() + ttl;
     }
-    ctx.store.set(args[1], args[2]);
-    resp::add_simple(ctx.out, "OK");
+
+    Store::Node* existing = ctx.store.find(args[1]);
+    if (get) {
+        if (existing) resp::add_bulk(ctx.out, existing->second.value);
+        else resp::add_null(ctx.out);
+    }
+    if ((nx && existing) || (xx && !existing)) {
+        if (!get) resp::add_null(ctx.out); // with GET, the old value was the reply
+        return;
+    }
+    Store::Node* n = ctx.store.upsert(args[1], args[2], keepttl);
+    if (deadline != NO_EXPIRY) ctx.store.set_expire(n, deadline);
+    if (!get) resp::add_simple(ctx.out, "OK");
 }
 
 // DEL key [key ...]  ->  integer: how many keys were actually removed.
-// "DEL k k" counts k once: the second delete finds nothing.
+// "DEL k k" counts k once; an already-expired key counts as not there.
 void cmd_del(const Args& args, CommandContext& ctx) {
     long long removed = 0;
     for (size_t i = 1; i < args.size(); i++)
-        if (ctx.store.del(args[i])) removed++;
+        if (ctx.store.erase(args[i])) removed++;
     resp::add_integer(ctx.out, removed);
 }
 
@@ -196,13 +240,112 @@ void cmd_del(const Args& args, CommandContext& ctx) {
 void cmd_exists(const Args& args, CommandContext& ctx) {
     long long n = 0;
     for (size_t i = 1; i < args.size(); i++)
-        if (ctx.store.exists(args[i])) n++;
+        if (ctx.store.find(args[i])) n++;
     resp::add_integer(ctx.out, n);
 }
 
-// DBSIZE  ->  number of keys.
+// DBSIZE  ->  number of keys (like Redis, may include expired keys that
+// haven't been removed yet; active expiry keeps that window ~1 ms).
 void cmd_dbsize(const Args&, CommandContext& ctx) {
     resp::add_integer(ctx.out, static_cast<long long>(ctx.store.size()));
+}
+
+// EXPIRE key seconds [NX | XX | GT | LT]     (PEXPIRE: milliseconds)
+//   -> 1 if the timeout was set (or the key was deleted because the TTL was
+//      <= 0), 0 if the key doesn't exist or an option condition failed.
+//   NX: only if the key has no TTL.   XX: only if it has one.
+//   GT: only if the new deadline is later.   LT: only if it's sooner.
+//   (A key without a TTL counts as an INFINITE TTL for GT/LT.)
+void expire_generic(const Args& args, CommandContext& ctx, long long unit_ms, const char* cmd) {
+    bool nx = false, xx = false, gt = false, lt = false;
+    for (size_t i = 3; i < args.size(); i++) {
+        if (iequals(args[i], "nx")) nx = true;
+        else if (iequals(args[i], "xx")) xx = true;
+        else if (iequals(args[i], "gt")) gt = true;
+        else if (iequals(args[i], "lt")) lt = true;
+        else {
+            std::string msg = "ERR Unsupported option ";
+            msg.append(args[i]);
+            resp::add_error(ctx.out, msg);
+            return;
+        }
+    }
+    if (nx && (xx || gt || lt)) {
+        resp::add_error(ctx.out, "ERR NX and XX, GT or LT options at the same time are not compatible");
+        return;
+    }
+    if (gt && lt) {
+        resp::add_error(ctx.out, "ERR GT and LT options at the same time are not compatible");
+        return;
+    }
+
+    long long when;
+    if (!resp::parse_integer(args[2], when)) {
+        resp::add_error(ctx.out, NOT_AN_INTEGER);
+        return;
+    }
+    // Negative TTLs are allowed (they delete the key), but the conversion to
+    // an absolute ms deadline must not overflow.
+    if (unit_ms == 1000) {
+        if (when > LLONG_MAX / 1000 || when < LLONG_MIN / 1000) {
+            invalid_expire_time(ctx, cmd);
+            return;
+        }
+        when *= 1000;
+    }
+    if (when > LLONG_MAX - ctx.store.now()) {
+        invalid_expire_time(ctx, cmd);
+        return;
+    }
+    when += ctx.store.now();
+
+    Store::Node* n = ctx.store.find(args[1]);
+    if (!n) {
+        resp::add_integer(ctx.out, 0);
+        return;
+    }
+    int64_t current = n->second.expire_at; // NO_EXPIRY (-1) = infinite
+    if ((nx && current != NO_EXPIRY) || (xx && current == NO_EXPIRY) ||
+        (gt && (current == NO_EXPIRY || when <= current)) ||
+        (lt && current != NO_EXPIRY && when >= current)) {
+        resp::add_integer(ctx.out, 0);
+        return;
+    }
+    if (when <= ctx.store.now()) {
+        ctx.store.erase(n); // deadline already passed: delete right away
+    } else {
+        ctx.store.set_expire(n, when);
+    }
+    resp::add_integer(ctx.out, 1);
+}
+
+void cmd_expire(const Args& args, CommandContext& ctx) { expire_generic(args, ctx, 1000, "expire"); }
+void cmd_pexpire(const Args& args, CommandContext& ctx) { expire_generic(args, ctx, 1, "pexpire"); }
+
+// TTL key  ->  seconds left (rounded), -1 if the key has no TTL, -2 if the
+// key doesn't exist.   PTTL: the same in milliseconds.
+void ttl_generic(const Args& args, CommandContext& ctx, bool in_ms) {
+    Store::Node* n = ctx.store.find(args[1]);
+    if (!n) {
+        resp::add_integer(ctx.out, -2);
+        return;
+    }
+    if (n->second.expire_at == NO_EXPIRY) {
+        resp::add_integer(ctx.out, -1);
+        return;
+    }
+    long long left = n->second.expire_at - ctx.store.now();
+    if (left < 0) left = 0;
+    resp::add_integer(ctx.out, in_ms ? left : (left + 500) / 1000); // round like Redis
+}
+
+void cmd_ttl(const Args& args, CommandContext& ctx) { ttl_generic(args, ctx, false); }
+void cmd_pttl(const Args& args, CommandContext& ctx) { ttl_generic(args, ctx, true); }
+
+// PERSIST key  ->  1 if a TTL was removed, 0 if the key is missing or had none.
+void cmd_persist(const Args& args, CommandContext& ctx) {
+    Store::Node* n = ctx.store.find(args[1]);
+    resp::add_integer(ctx.out, (n && ctx.store.clear_expire(n)) ? 1 : 0);
 }
 
 const std::unordered_map<std::string, CommandSpec>& command_table() {
@@ -218,6 +361,11 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         {"del",     {-2, cmd_del,      1, -1, 1}},
         {"exists",  {-2, cmd_exists,   1, -1, 1}},
         {"dbsize",  {1,  cmd_dbsize}},
+        {"expire",  {-3, cmd_expire,   1, 1, 1}},
+        {"pexpire", {-3, cmd_pexpire,  1, 1, 1}},
+        {"ttl",     {2,  cmd_ttl,      1, 1, 1}},
+        {"pttl",    {2,  cmd_pttl,     1, 1, 1}},
+        {"persist", {2,  cmd_persist,  1, 1, 1}},
     };
     return table;
 }
@@ -247,7 +395,7 @@ void unknown_command(const Args& args, CommandContext& ctx) {
 } // namespace
 
 void execute_command(const Args& args, CommandContext& ctx) {
-    // No command name is longer than 7 chars; don't lowercase-copy a 100 MB
+    // No command name is longer than 7 chars ("command", "pexpire"); don't lowercase-copy a 100 MB
     // garbage "name" just to find out it's unknown.
     if (args[0].size() > 16) {
         unknown_command(args, ctx);

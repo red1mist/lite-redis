@@ -6,12 +6,8 @@
 
 namespace resp {
 
-namespace {
-
-// Strict decimal integer, same rules as Redis's string2ll: optional '-', then
-// digits, no '+', no leading zeros ("01", "-0" are invalid), no overflow.
 // (atoi/strtol would silently accept "12abc" or "" as a number.)
-bool parse_int(std::string_view s, long long& out) {
+bool parse_integer(std::string_view s, long long& out) {
     if (s.empty()) return false;
     size_t digits_at = (s[0] == '-') ? 1 : 0;
     if (digits_at == s.size()) return false;
@@ -20,6 +16,8 @@ bool parse_int(std::string_view s, long long& out) {
     auto [ptr, ec] = std::from_chars(s.data(), end, out);
     return ec == std::errc() && ptr == end;
 }
+
+namespace {
 
 bool is_hex(char c) { return std::isxdigit(static_cast<unsigned char>(c)) != 0; }
 int hex_val(char c) {
@@ -153,7 +151,7 @@ ParseStatus read_header(std::string_view buf, size_t& pos, size_t& scanned, long
         return ParseStatus::Incomplete;
     }
     scanned = 0;
-    if (!parse_int(buf.substr(pos + 1, eol - pos - 1), value)) {
+    if (!parse_integer(buf.substr(pos + 1, eol - pos - 1), value)) {
         err = std::string("invalid ") + what + " length";
         return ParseStatus::Error;
     }

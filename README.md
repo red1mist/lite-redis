@@ -13,7 +13,7 @@ no threads, no external libraries, just POSIX sockets and Linux `epoll`.
 - [x] Stage 2 — non-blocking I/O + `epoll` event loop (concurrent clients)
 - [x] Stage 3 — RESP protocol parser (`redis-cli` compatible)
 - [x] Stage 4 — key-value store: `SET`, `GET`, `DEL` (+ `EXISTS`, `DBSIZE`)
-- [ ] Stage 5 — key expiry: `EXPIRE`, `TTL` (min-heap timer + lazy deletion)
+- [x] Stage 5 — key expiry: `EXPIRE`, `TTL` (min-heap timer + lazy deletion)
 - [ ] Stage 6 — tests + Valgrind leak check under load
 - [ ] Stage 7 — `redis-benchmark` results
 
@@ -23,7 +23,8 @@ no threads, no external libraries, just POSIX sockets and Linux `epoll`.
 src/main.cpp      epoll event loop, connections, buffering, backpressure
 src/resp.cpp      incremental RESP parser (partial reads, pipelining) + reply encoders
 src/commands.cpp  command table and handlers
-src/store.cpp     the keyspace (hash table, string_view lookups)
+src/store.cpp     the keyspace (hash table, string_view lookups) and key
+                  expiry (indexed min-heap + lazy deletion)
 test/             raw-RESP integration tests (also run against real Redis
                   as a differential check), redis-cli smoke test, maxclients
                   and leak-at-exit checks
@@ -38,7 +39,9 @@ container. The source is bind-mounted, so edit on the host as usual.
 ./dev make            # optimized build -> ./lite-redis-server
 ./dev make debug      # AddressSanitizer build -> ./lite-redis-server-debug
 ./dev make run        # build + start the server on :6379
-./dev make test       # ASan build + all tests + differential run vs real Redis
+./dev make test       # unit tests + ASan build + all integration tests +
+                      # differential run vs real Redis
+./dev make unit       # just the store/expiry-heap unit test (fake clock)
 
 # in a second terminal (same container):
 ./dev redis-cli
@@ -52,11 +55,25 @@ connect/disconnect). `Ctrl-C` / `SIGTERM` shut down cleanly.
 
 ## Supported commands
 
-`PING`, `ECHO`, `QUIT`, `GET`, `SET key value [NX|XX]`, `DEL`, `EXISTS`,
-`DBSIZE`, plus `COMMAND` / `CONFIG GET` stubs so `redis-cli` and
+`PING`, `ECHO`, `QUIT`, `GET`,
+`SET key value [NX|XX] [GET] [EX s|PX ms|KEEPTTL]`, `DEL`, `EXISTS`, `DBSIZE`,
+`EXPIRE`/`PEXPIRE key ttl [NX|XX|GT|LT]`, `TTL`, `PTTL`, `PERSIST`, plus `COMMAND` / `CONFIG GET` stubs so `redis-cli` and
 `redis-benchmark` work unmodified. Inline commands (telnet/nc) support Redis's
 quoting rules.
 
 When benchmarking, select the implemented commands, e.g.
 `redis-benchmark -t set,get`: the default suite also runs `INCR`, `LPUSH` etc.,
 which aren't implemented and make it exit.
+
+## How key expiry works
+
+- **Lazy deletion:** every lookup checks the key's deadline; an expired key
+  is deleted on the spot and treated as missing, so clients never see one.
+- **Active expiry:** keys with a TTL live in an **indexed binary min-heap**
+  ordered by deadline. Before each `epoll_wait` the loop deletes due keys (at
+  most 1000 per pass, so a mass expiry can't stall clients) and sleeps no
+  longer than until the next deadline. Each entry stores its heap position, so
+  `DEL` / `PERSIST` / a new `EXPIRE` fix the heap in O(log n) and the heap
+  never accumulates stale nodes.
+- Deadlines use `CLOCK_MONOTONIC`, so wall-clock adjustments can't mass-expire
+  keys. (`EXAT`/`PXAT`/`EXPIREAT` absolute times are not supported.)

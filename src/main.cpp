@@ -11,10 +11,12 @@
 #include "store.h"
 
 #include <arpa/inet.h>
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <climits>
 #include <cstring>
 #include <ctime>
 #include <fcntl.h>
@@ -49,6 +51,11 @@ constexpr size_t MAX_QUERY_BUF = 1024ul * 1024 * 1024;
 // While the listener is switched off after fd exhaustion, retry this often
 // (in case no client ever disconnects to free an fd).
 constexpr int LISTENER_RETRY_MS = 100;
+// Max keys deleted by one active-expiry pass. If more are due, the loop polls
+// (timeout 0) so client I/O interleaves with a mass expiry instead of the
+// server freezing while a million keys that expired in the same millisecond
+// are freed.
+constexpr size_t EXPIRE_BUDGET = 1000;
 // Buffers bigger than this are given back to the allocator once idle, so one
 // big request doesn't pin memory for the rest of a connection's life.
 constexpr size_t IDLE_BUF_KEEP = 64 * 1024;
@@ -134,6 +141,18 @@ static bool set_nonblocking(int fd) {
 }
 
 static size_t pending_output(const Conn& c) { return c.wbuf.size() - c.wpos; }
+
+// Milliseconds on the MONOTONIC clock: it never jumps backwards or forwards
+// when the wall clock is adjusted (NTP, a sysadmin, DST), so a clock change
+// can't make every key expire at once or live forever. (Real Redis stores
+// wall-clock deadlines because it persists them to disk and replicas; we
+// keep everything in memory, so monotonic is the safer choice.)
+// clock_gettime is a vDSO call: no real syscall, ~20 ns.
+static int64_t monotonic_ms() {
+    timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<int64_t>(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
+}
 
 // Level-triggered epoll (the default, no EPOLLET): epoll_wait keeps reporting
 // a socket as long as the condition holds (unread data / room to write). That
@@ -319,6 +338,7 @@ static void process_input(Conn& c) {
 
         // args point into c.rbuf; replies go to c.wbuf, a different buffer,
         // so the views stay valid while the command runs.
+        store.set_now(monotonic_ms()); // one consistent "now" per command
         CommandContext ctx{c.wbuf, store};
         execute_command(args, ctx);
         if (ctx.close_after_reply) c.closing = true;
@@ -563,9 +583,25 @@ int main(int argc, char** argv) {
 
     epoll_event events[MAX_EVENTS];
     while (!stop_requested) {
-        // Sleep until at least one fd is ready. Timeout -1 = wait forever.
-        // (Stage 5 replaces -1 with "time until the next key expires".)
-        int timeout = listener_disarmed ? LISTENER_RETRY_MS : -1;
+        // Active expiry, then decide how long we may sleep.
+        //
+        // The single thread is either running handlers or blocked in
+        // epoll_wait, so timers have to be folded into the wait itself: peek
+        // at the min-heap's root (the soonest deadline) and sleep no longer
+        // than until then. If nothing has a TTL, sleep until I/O arrives.
+        // This is how event loops schedule timers (libuv, Node, asyncio's
+        // call_later, Redis's aeProcessEvents all do the same).
+        store.set_now(monotonic_ms());
+        bool more_due = store.expire_due(EXPIRE_BUDGET);
+        int timeout = -1;
+        if (more_due) {
+            timeout = 0; // poll: serve ready clients, then expire the next batch
+        } else if (int64_t next = store.next_expiry(); next != NO_EXPIRY) {
+            int64_t wait = next - store.now();
+            timeout = wait <= 0 ? 0 : static_cast<int>(std::min<int64_t>(wait, INT_MAX));
+        }
+        if (listener_disarmed)
+            timeout = timeout < 0 ? LISTENER_RETRY_MS : std::min(timeout, LISTENER_RETRY_MS);
         int n = epoll_wait(epfd, events, MAX_EVENTS, timeout);
         if (n < 0) {
             if (errno == EINTR) continue; // e.g. SIGSTOP/SIGCONT from a debugger

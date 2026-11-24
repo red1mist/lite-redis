@@ -9,7 +9,7 @@ OBJ := $(SRC:src/%.cpp=$(OBJ_DIR)/%.o)
 BIN := lite-redis-server
 DEBUG_BIN := lite-redis-server-debug
 
-.PHONY: all debug clean run run-debug test
+.PHONY: all debug clean run run-debug test unit
 
 # Default target: optimized build, used when you just run `make`.
 all: CXXFLAGS += -O2
@@ -46,8 +46,16 @@ run-debug: debug
 	./$(DEBUG_BIN)
 
 clean:
-	rm -rf $(OBJ_DIR) $(BIN) $(DEBUG_BIN) $(DEBUG_BIN).dSYM
+	rm -rf $(OBJ_DIR) $(BIN) $(DEBUG_BIN) $(DEBUG_BIN).dSYM $(UNIT_BIN)
 
-# Builds the ASan binary, runs it on a spare port, runs all tests against it.
-test: debug
+# Unit test of the keyspace + expiry heap with a fake clock, under
+# AddressSanitizer and UndefinedBehaviorSanitizer.
+UNIT_BIN := build/store_test
+unit: | $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined \
+		-o $(UNIT_BIN) test/store_test.cpp src/store.cpp
+	./$(UNIT_BIN)
+
+# Unit tests, then the ASan server on a spare port with all integration tests.
+test: unit debug
 	./test/run_tests.sh
